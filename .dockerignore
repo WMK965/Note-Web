@@ -1,0 +1,10 @@
+data/
+*.db
+*.db-wal
+*.db-shm
+.git
+.gitignore
+*.md
+Dockerfile
+docker-compose.yml
+.dockerignore

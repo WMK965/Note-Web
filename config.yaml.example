@@ -1,0 +1,26 @@
+server:
+  host: "0.0.0.0"
+  port: 8080
+
+pdf:
+  dirs:
+    - /documents
+  scan_interval: 300
+
+render:
+  jpeg_quality: 80
+  scale_width: 1080
+  thumb_width: 200
+
+active_cache:
+  render_concurrency: 3
+  watch_debounce: 1h
+  poll_interval: 30s
+
+passive_cache:
+  max_size_mb: 2048
+
+database:
+  path: /data/note-web.db
+
+cache_dir: /data/cache

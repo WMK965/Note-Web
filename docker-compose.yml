@@ -1,0 +1,10 @@
+services:
+  note-web:
+    build: .
+    container_name: note-web
+    ports:
+      - "8080:8080"
+    volumes:
+      - /Disk/Backup/GoodNotes:/documents:ro
+      - /opt/Configs/Note-Web:/data
+    restart: unless-stopped

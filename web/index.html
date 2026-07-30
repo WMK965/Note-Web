@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta name="theme-color" content="#0f0f0f">
+    <title>Note-Web</title>
+    <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+
+<div id="library" class="view">
+    <header class="lib-header">
+        <div id="breadcrumb" class="breadcrumb"></div>
+        <input type="search" id="search" placeholder="搜索..." autocomplete="off">
+    </header>
+    <div id="pdf-list" class="pdf-list"></div>
+</div>
+
+<div id="reader" class="view hidden">
+    <header class="reader-header">
+        <button id="back-btn" class="icon-btn" aria-label="返回">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 12H5M12 19l-7-7 7-7"/></svg>
+        </button>
+        <span id="reader-title" class="reader-title"></span>
+        <button id="reader-pin" class="icon-btn" aria-label="缓存"></button>
+    </header>
+    <div id="page-area" class="page-area">
+        <div id="page-loader" class="page-loader hidden">
+            <div class="spinner"></div>
+            <span>渲染中...</span>
+        </div>
+        <img id="page-img" class="page-img" alt="">
+        <div id="tap-left" class="tap-zone tap-left"></div>
+        <div id="tap-right" class="tap-zone tap-right"></div>
+    </div>
+    <footer class="reader-footer">
+        <button id="prev-btn" class="nav-btn" aria-label="上一页">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 18l-6-6 6-6"/></svg>
+        </button>
+        <div class="page-nav">
+            <input type="number" id="page-input" min="1" value="1" inputmode="numeric">
+            <span class="page-sep">/</span>
+            <span id="page-total">1</span>
+        </div>
+        <button id="next-btn" class="nav-btn" aria-label="下一页">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18l6-6-6-6"/></svg>
+        </button>
+    </footer>
+</div>
+
+<div id="toast" class="toast hidden"></div>
+
+<script src="/app.js"></script>
+</body>
+</html>
