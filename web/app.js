@@ -1,44 +1,71 @@
+// ==========================================================================
+// Note-Web 前端应用
+// 基于 hash 路由的 SPA，包含文件库浏览和 PDF 阅读器两大视图
+// ==========================================================================
+
+// 快捷获取 DOM 元素
 const $ = id => document.getElementById(id);
 
-// ===== State =====
-let allPDFs = [];
-let currentFolder = '';
-let isSearchMode = false;
+// ===== 全局状态 =====
 
-let currentPDF = null;
-let currentPDFKey = null;
-let currentPDFFolder = '';
-let currentPage = 1;
-let pageCount = 0;
-let requestID = 0;
+// 文件库状态
+let allPDFs = [];          // 从后端获取的全部 PDF 列表
+let currentFolder = '';    // 当前所在文件夹的相对路径（如 "1/2"）
+let isSearchMode = false;  // 是否处于搜索模式
 
-// Zoom state
-let zoom = 1;
-let panX = 0;
-let panY = 0;
-let lastTouchDist = 0;
-let touchStartX = 0;
-let touchStartY = 0;
-let lastTapTime = 0;
+// 阅读器状态
+let currentPDF = null;       // 当前 PDF 在数据库中的 ID
+let currentPDFKey = null;    // 当前 PDF 的 cache_key（路径哈希，用于 URL 路由）
+let currentPDFFolder = '';   // 当前 PDF 所在的文件夹路径（用于返回按钮导航）
+let currentPage = 1;         // 当前页码
+let pageCount = 0;           // 当前 PDF 总页数
+let requestID = 0;           // 请求计数器，用于丢弃过时的页面加载请求
+let preloadedPages = new Set(); // 已预加载的页面 URL 集合，避免重复请求
 
-// ===== Icons =====
+// 跳转历史状态
+// 每个条目是 { target: 目标页码, anchor: 锚点页码 }
+// 当用户在锚点 ±10 页范围内时，对应方向的箭头可用
+let jumpBack = null;     // 向后跳转目标（如从200跳到100后，jumpBack = { target: 200, anchor: 100 }）
+let jumpForward = null;  // 向前跳转目标
+
+// 缩放状态
+let zoom = 1;                // 当前缩放倍率（1~4）
+let panX = 0;                // X 方向平移偏移（像素）
+let panY = 0;                // Y 方向平移偏移（像素）
+let pinchStartDist = 0;      // 双指捏合开始时的两指距离
+let pinchStartFocal = null;  // 双指捏合开始时的焦点（相对图片左上角）
+let pinchStartZoom = 1;      // 双指捏合开始时的缩放倍率
+let pinchStartPanX = 0;      // 双指捏合开始时的 X 平移
+let pinchStartPanY = 0;      // 双指捏合开始时的 Y 平移
+let panStartX = 0;           // 单指拖拽开始时的 X 坐标
+let panStartY = 0;           // 单指拖拽开始时的 Y 坐标
+let panOrigX = 0;            // 单指拖拽开始时的 panX 值
+let panOrigY = 0;            // 单指拖拽开始时的 panY 值
+let swipeStartX = 0;         // 滑动手势开始时的 X 坐标
+let swipeStartY = 0;         // 滑动手势开始时的 Y 坐标
+
+// ===== SVG 图标常量 =====
 const ICON_FOLDER = '<svg class="folder-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>';
 const ICON_FILE = '<svg class="pdf-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg>';
 const ICON_BOOKMARK = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/></svg>';
 const ICON_BOOKMARK_FILL = '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/></svg>';
 
-// ===== Utilities =====
+// ===== 工具函数 =====
+
+/** 转义 HTML 特殊字符，防止 XSS */
 function escapeHtml(s) {
     const div = document.createElement('div');
     div.textContent = s;
     return div.innerHTML;
 }
 
+/** 将字节数格式化为人类可读的大小（KB/MB） */
 function formatSize(bytes) {
     if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(0) + ' KB';
     return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
 }
 
+/** 显示一条底部悬浮提示消息，默认 2 秒后自动消失 */
 function showToast(msg, duration = 2000) {
     const t = $('toast');
     t.textContent = msg;
@@ -47,6 +74,7 @@ function showToast(msg, duration = 2000) {
     t._timer = setTimeout(() => t.classList.add('hidden'), duration);
 }
 
+/** 发起 API 请求，返回 Response 对象，失败时抛出异常 */
 async function api(path, opts) {
     const res = await fetch(path, opts);
     if (!res.ok) {
@@ -56,41 +84,52 @@ async function api(path, opts) {
     return res;
 }
 
+/** 发起 GET 请求并解析 JSON 响应 */
 async function apiJSON(path) {
     const res = await fetch(path);
     if (!res.ok) throw new Error('Request failed');
     return res.json();
 }
 
-// ===== Routing =====
+/** 根据页码生成对应页面的 API URL */
+function pageURL(page) {
+    return `/api/pdfs/${currentPDFKey}/page/${page}`;
+}
+
+// ===== URL 路由 =====
+
+/**
+ * 解析当前 URL hash 并切换到对应视图
+ * 路由格式：
+ *   #/                     -> 文件库根目录
+ *   #/folder/1/2           -> 文件库子目录 "1/2"
+ *   #/read/{cacheKey}      -> 阅读器（自动恢复上次页码）
+ *   #/read/{cacheKey}/5    -> 阅读器第5页
+ */
 function handleRoute() {
     const hash = location.hash.slice(1) || '/';
     const parts = hash.split('/').filter(Boolean);
-
     if (parts[0] === 'read' && parts[1]) {
-        const key = parts[1];
-        const page = parts[2] ? parseInt(parts[2]) : null;
-        showReader(key, page);
+        showReader(parts[1], parts[2] ? parseInt(parts[2]) : null);
     } else if (parts[0] === 'folder') {
-        const folder = parts.slice(1).map(decodeURIComponent).join('/');
-        showFolder(folder);
+        showFolder(parts.slice(1).map(decodeURIComponent).join('/'));
     } else {
         showFolder('');
     }
 }
-
 window.addEventListener('hashchange', handleRoute);
 
-// ===== Library / Folder View =====
+// ===== 文件库 / 文件夹视图 =====
+
+/** 从后端加载所有 PDF 列表，然后根据当前 hash 路由渲染对应视图 */
 async function loadLibrary() {
     try {
         allPDFs = await apiJSON('/api/pdfs');
         handleRoute();
-    } catch (e) {
-        showToast('加载失败');
-    }
+    } catch (e) { showToast('加载失败'); }
 }
 
+/** 显示指定文件夹的内容，隐藏阅读器 */
 function showFolder(folder) {
     currentFolder = folder;
     $('library').classList.remove('hidden');
@@ -101,6 +140,10 @@ function showFolder(folder) {
     renderFolder(folder);
 }
 
+/**
+ * 渲染面包屑导航（根目录 / 子目录1 / 子目录2）
+ * 每一级都是可点击链接，最后一级为当前目录（不可点击）
+ */
 function renderBreadcrumb(folder) {
     const bc = $('breadcrumb');
     let html = '<a href="#/">根目录</a>';
@@ -119,240 +162,234 @@ function renderBreadcrumb(folder) {
     bc.innerHTML = html;
 }
 
+/**
+ * 从 allPDFs 中提取指定文件夹下的内容
+ * @param {string} folder - 文件夹相对路径，空字符串表示根目录
+ * @returns {{folders: Array, pdfs: Array}} folders 是 [名称, 文件数] 数组，pdfs 是 PDF 对象数组
+ */
 function getFolderContents(folder) {
     const prefix = folder ? folder + '/' : '';
-    const folders = new Map();
-    const pdfs = [];
+    const folders = new Map(); // 子文件夹名 -> 文件计数
+    const pdfs = [];           // 直接位于该文件夹下的 PDF
 
     for (const pdf of allPDFs) {
         const rp = pdf.relative_path;
-        if (!rp.startsWith(prefix)) continue;
-        const remaining = rp.slice(prefix.length);
+        if (!rp.startsWith(prefix)) continue;       // 不在当前文件夹下
+        const remaining = rp.slice(prefix.length);   // 去掉前缀后的剩余路径
         const slashIdx = remaining.indexOf('/');
-
         if (slashIdx === -1) {
+            // 没有更深层的斜杠，说明是当前文件夹的直接文件
             pdfs.push(pdf);
         } else {
+            // 有斜杠，说明在子文件夹中，记录子文件夹名
             const name = remaining.slice(0, slashIdx);
-            if (!folders.has(name)) {
-                folders.set(name, 0);
-            }
-            folders.set(name, folders.get(name) + 1);
+            folders.set(name, (folders.get(name) || 0) + 1);
         }
     }
-
     return {
         folders: [...folders.entries()].sort((a, b) => a[0].localeCompare(b[0], 'zh')),
         pdfs: pdfs.sort((a, b) => a.title.localeCompare(b.title, 'zh'))
     };
 }
 
+/**
+ * 生成 PDF 的缓存状态信息（用于文件列表显示）
+ * - 已完成缓存：显示绿色"已缓存"徽章，无进度条
+ * - 缓存进行中：显示"缓存中 X/Y"和进度条
+ * - 等待缓存：显示"等待缓存"和空进度条
+ * - 未缓存：不显示任何缓存信息
+ */
+function renderCacheInfo(pdf) {
+    const metaParts = [`${pdf.page_count} 页`, formatSize(pdf.file_size)];
+    let cacheBar = '';
+    if (pdf.pinned) {
+        if (pdf.cached_pages >= pdf.page_count && pdf.page_count > 0) {
+            // 缓存完成
+            metaParts.push('<span class="pdf-badge">已缓存</span>');
+        } else if (pdf.cached_pages > 0) {
+            // 缓存进行中
+            metaParts.push(`缓存中 ${pdf.cached_pages}/${pdf.page_count}`);
+            const pct = (pdf.cached_pages / pdf.page_count * 100).toFixed(0);
+            cacheBar = `<div class="pdf-cache-bar"><div class="pdf-cache-fill" style="width:${pct}%"></div></div>`;
+        } else {
+            // 已标记但尚未开始缓存
+            metaParts.push('等待缓存');
+            cacheBar = `<div class="pdf-cache-bar"><div class="pdf-cache-fill" style="width:0%"></div></div>`;
+        }
+    }
+    return { metaParts: metaParts.join(' · '), cacheBar };
+}
+
+/** 渲染文件夹内容：子文件夹列表 + PDF 文件列表 */
 function renderFolder(folder) {
     const list = $('pdf-list');
     const { folders, pdfs } = getFolderContents(folder);
-
     if (folders.length === 0 && pdfs.length === 0) {
         list.innerHTML = '<div style="text-align:center;padding:40px;color:var(--text-muted)">暂无文件</div>';
         return;
     }
-
     let html = '';
+    // 渲染子文件夹
     for (const [name, count] of folders) {
         const path = folder ? folder + '/' + name : name;
-        html += `<div class="folder-item" data-folder="${escapeHtml(path)}">
-            ${ICON_FOLDER}
-            <span class="folder-name">${escapeHtml(name)}</span>
-            <span class="folder-count">${count} 个文件</span>
-        </div>`;
+        html += `<div class="folder-item" data-folder="${escapeHtml(path)}">${ICON_FOLDER}<span class="folder-name">${escapeHtml(name)}</span><span class="folder-count">${count} 个文件</span></div>`;
     }
-
+    // 渲染 PDF 文件
     for (const pdf of pdfs) {
-        let cacheBar = '';
-        if (pdf.pinned && pdf.page_count > 0) {
-            const pct = (pdf.cached_pages / pdf.page_count * 100).toFixed(0);
-            cacheBar = `<div class="pdf-cache-bar"><div class="pdf-cache-fill" style="width:${pct}%"></div></div>`;
-        }
-        const metaParts = [`${pdf.page_count} 页`, formatSize(pdf.file_size)];
-        if (pdf.pinned) metaParts.push(`已缓存 ${pdf.cached_pages}/${pdf.page_count}`);
-
-        html += `<div class="pdf-item" data-key="${pdf.cache_key}" data-folder="${escapeHtml(folder)}">
-            ${ICON_FILE}
-            <div class="pdf-info">
+        const ci = renderCacheInfo(pdf);
+        html += `<div class="pdf-item" data-key="${pdf.cache_key}">
+            ${ICON_FILE}<div class="pdf-info">
                 <div class="pdf-title">${escapeHtml(pdf.title)}</div>
-                <div class="pdf-meta">${metaParts.join(' · ')}</div>
-                ${cacheBar}
+                <div class="pdf-meta">${ci.metaParts}</div>${ci.cacheBar}
             </div>
-            <button class="pin-btn ${pdf.pinned ? 'pinned' : ''}" data-pin="${pdf.cache_key}">
-                ${pdf.pinned ? ICON_BOOKMARK_FILL : ICON_BOOKMARK}
-            </button>
+            <button class="pin-btn ${pdf.pinned ? 'pinned' : ''}" data-pin="${pdf.cache_key}">${pdf.pinned ? ICON_BOOKMARK_FILL : ICON_BOOKMARK}</button>
         </div>`;
     }
-
     list.innerHTML = html;
-
-    list.querySelectorAll('.folder-item').forEach(el => {
-        el.addEventListener('click', () => {
-            location.hash = '#/folder/' + encodeURIComponent(el.dataset.folder);
-        });
-    });
-
-    list.querySelectorAll('.pdf-item').forEach(el => {
-        el.addEventListener('click', e => {
-            if (e.target.closest('.pin-btn')) return;
-            location.hash = '#/read/' + el.dataset.key;
-        });
-    });
-
-    list.querySelectorAll('.pin-btn').forEach(btn => {
-        btn.addEventListener('click', e => {
-            e.stopPropagation();
-            const key = btn.dataset.pin;
-            const pdf = allPDFs.find(p => p.cache_key === key);
-            togglePin(key, btn, pdf);
-        });
-    });
+    bindListItems(list);
 }
 
-// ===== Search =====
-$('search').addEventListener('input', e => {
-    const q = e.target.value.toLowerCase().trim();
-    if (!q) {
-        isSearchMode = false;
-        renderFolder(currentFolder);
-        return;
-    }
-    isSearchMode = true;
-    const filtered = allPDFs.filter(p =>
-        p.title.toLowerCase().includes(q) ||
-        p.relative_path.toLowerCase().includes(q)
-    );
-    renderSearchResults(filtered);
-});
-
+/** 渲染搜索结果（扁平列表，显示文件所在目录） */
 function renderSearchResults(pdfs) {
     const list = $('pdf-list');
     if (pdfs.length === 0) {
         list.innerHTML = '<div style="text-align:center;padding:40px;color:var(--text-muted)">未找到匹配文件</div>';
         return;
     }
-
     let html = '';
     for (const pdf of pdfs) {
-        const dir = pdf.relative_path.includes('/')
-            ? pdf.relative_path.slice(0, pdf.relative_path.lastIndexOf('/'))
-            : '';
-        let cacheBar = '';
-        if (pdf.pinned && pdf.page_count > 0) {
-            const pct = (pdf.cached_pages / pdf.page_count * 100).toFixed(0);
-            cacheBar = `<div class="pdf-cache-bar"><div class="pdf-cache-fill" style="width:${pct}%"></div></div>`;
-        }
-        const metaParts = [`${pdf.page_count} 页`, formatSize(pdf.file_size)];
-        if (dir) metaParts.push(dir);
-
-        html += `<div class="pdf-item" data-key="${pdf.cache_key}" data-folder="${escapeHtml(dir)}">
-            ${ICON_FILE}
-            <div class="pdf-info">
+        const dir = pdf.relative_path.includes('/') ? pdf.relative_path.slice(0, pdf.relative_path.lastIndexOf('/')) : '';
+        const ci = renderCacheInfo(pdf);
+        const metaParts = ci.metaParts + (dir ? ' · ' + escapeHtml(dir) : '');
+        html += `<div class="pdf-item" data-key="${pdf.cache_key}">
+            ${ICON_FILE}<div class="pdf-info">
                 <div class="pdf-title">${escapeHtml(pdf.title)}</div>
-                <div class="pdf-meta">${metaParts.join(' · ')}</div>
-                ${cacheBar}
+                <div class="pdf-meta">${metaParts}</div>${ci.cacheBar}
             </div>
-            <button class="pin-btn ${pdf.pinned ? 'pinned' : ''}" data-pin="${pdf.cache_key}">
-                ${pdf.pinned ? ICON_BOOKMARK_FILL : ICON_BOOKMARK}
-            </button>
+            <button class="pin-btn ${pdf.pinned ? 'pinned' : ''}" data-pin="${pdf.cache_key}">${pdf.pinned ? ICON_BOOKMARK_FILL : ICON_BOOKMARK}</button>
         </div>`;
     }
-
     list.innerHTML = html;
+    bindListItems(list);
+}
 
+/** 为列表中的文件夹项、PDF 项和缓存按钮绑定点击事件 */
+function bindListItems(list) {
+    // 文件夹点击 -> 导航到子文件夹
+    list.querySelectorAll('.folder-item').forEach(el => {
+        el.addEventListener('click', () => { location.hash = '#/folder/' + encodeURIComponent(el.dataset.folder); });
+    });
+    // PDF 点击 -> 打开阅读器
     list.querySelectorAll('.pdf-item').forEach(el => {
         el.addEventListener('click', e => {
-            if (e.target.closest('.pin-btn')) return;
+            if (e.target.closest('.pin-btn')) return; // 点击的是缓存按钮，不打开阅读器
             location.hash = '#/read/' + el.dataset.key;
         });
     });
-
+    // 缓存按钮点击 -> 切换缓存状态
     list.querySelectorAll('.pin-btn').forEach(btn => {
         btn.addEventListener('click', e => {
             e.stopPropagation();
             const key = btn.dataset.pin;
-            const pdf = allPDFs.find(p => p.cache_key === key);
-            togglePin(key, btn, pdf);
+            togglePin(key, btn, allPDFs.find(p => p.cache_key === key));
         });
     });
 }
 
-// ===== Pin / Unpin =====
+// ===== 搜索 =====
+// 输入框内容变化时，按标题和路径过滤 PDF 列表
+$('search').addEventListener('input', e => {
+    const q = e.target.value.toLowerCase().trim();
+    if (!q) { isSearchMode = false; renderFolder(currentFolder); return; } // 清空搜索 -> 回到文件夹视图
+    isSearchMode = true;
+    renderSearchResults(allPDFs.filter(p =>
+        p.title.toLowerCase().includes(q) || p.relative_path.toLowerCase().includes(q)));
+});
+
+// ===== 缓存标记 / 取消标记 =====
+
+/**
+ * 切换 PDF 的主动缓存状态
+ * 标记缓存：调用后端 PUT /pin，触发全量预渲染
+ * 取消缓存：调用后端 DELETE /pin，缓存转为被动模式（可被 LRU 淘汰）
+ */
 async function togglePin(key, btn, pdf) {
+    if (!pdf) return;
     try {
         if (pdf.pinned) {
+            // 取消缓存
             await api(`/api/pdfs/${key}/pin`, { method: 'DELETE' });
-            pdf.pinned = false;
-            pdf.cached_pages = 0;
-            pdf.cache_active = false;
-            btn.classList.remove('pinned');
-            btn.innerHTML = ICON_BOOKMARK;
+            pdf.pinned = false; pdf.cached_pages = 0; pdf.cache_active = false;
+            btn.classList.remove('pinned'); btn.innerHTML = ICON_BOOKMARK;
             showToast('已取消缓存');
-            if (isSearchMode) renderSearchResults(allPDFs.filter(p =>
-                p.title.toLowerCase().includes($('search').value.toLowerCase().trim())));
+            if (isSearchMode) { $('search').dispatchEvent(new Event('input')); }
             else renderFolder(currentFolder);
         } else {
+            // 标记缓存
             await api(`/api/pdfs/${key}/pin`, { method: 'PUT' });
             pdf.pinned = true;
-            btn.classList.add('pinned');
-            btn.innerHTML = ICON_BOOKMARK_FILL;
+            btn.classList.add('pinned'); btn.innerHTML = ICON_BOOKMARK_FILL;
             showToast('已标记缓存，后台渲染中...');
-            pollCacheStatus(key, pdf);
+            pollCacheStatus(key, pdf); // 开始轮询缓存进度
         }
-    } catch (e) {
-        showToast('操作失败: ' + e.message);
-    }
+    } catch (e) { showToast('操作失败: ' + e.message); }
 }
 
+/**
+ * 每 3 秒轮询 PDF 的缓存状态，更新文件列表中的进度条
+ * 当缓存完成或取消缓存时停止轮询
+ */
 async function pollCacheStatus(key, pdf) {
     const interval = setInterval(async () => {
         try {
             const status = await apiJSON(`/api/pdfs/${key}/cache`);
             if (!status.pinned) { clearInterval(interval); return; }
             pdf.cached_pages = status.cached;
-            if (status.cached >= status.total && !status.rebuilding) {
-                clearInterval(interval);
-            }
             if (!isSearchMode) renderFolder(currentFolder);
+            else { $('search').dispatchEvent(new Event('input')); }
+            if (status.cached >= status.total && !status.rebuilding) clearInterval(interval);
         } catch (e) { }
     }, 3000);
 }
 
-// ===== Reader =====
+// ===== 阅读器 =====
+
+/**
+ * 打开阅读器，加载指定 PDF
+ * @param {string} key - PDF 的 cache_key
+ * @param {number|null} page - 指定页码，null 则恢复上次阅读位置
+ */
 function showReader(key, page) {
     const pdf = allPDFs.find(p => p.cache_key === key);
-    if (!pdf) {
-        showToast('PDF not found');
-        location.hash = '#/';
-        return;
-    }
-
+    if (!pdf) { showToast('PDF not found'); location.hash = '#/'; return; }
     currentPDF = pdf.id;
     currentPDFKey = key;
-    currentPDFFolder = pdf.relative_path.includes('/')
-        ? pdf.relative_path.slice(0, pdf.relative_path.lastIndexOf('/'))
-        : '';
+    // 计算 PDF 所在文件夹路径（用于返回按钮导航）
+    currentPDFFolder = pdf.relative_path.includes('/') ? pdf.relative_path.slice(0, pdf.relative_path.lastIndexOf('/')) : '';
     pageCount = pdf.page_count;
-
+    // 恢复上次阅读位置
     const savedPage = parseInt(localStorage.getItem(`pdf-${key}-page`)) || 1;
     currentPage = page || savedPage;
     if (currentPage > pageCount) currentPage = 1;
 
+    // 重置跳转历史和预加载缓存
+    jumpBack = null; jumpForward = null;
+    preloadedPages.clear();
+
+    // 切换视图
     $('library').classList.add('hidden');
     $('reader').classList.remove('hidden');
     $('reader-title').textContent = pdf.title;
     $('page-total').textContent = pageCount;
     $('page-input').max = pageCount;
-
     updatePinButton(pdf);
+    $('overlay-wrapper').style.display = 'none'; // 确保叠加层隐藏
     resetZoom();
+    updateJumpButtons();
     loadPage(currentPage, 'fade');
 }
 
+/** 更新阅读器头部的缓存按钮状态 */
 function updatePinButton(pdf) {
     const btn = $('reader-pin');
     btn.className = 'icon-btn pin-btn ' + (pdf.pinned ? 'pinned' : '');
@@ -360,84 +397,287 @@ function updatePinButton(pdf) {
     btn.onclick = () => togglePin(currentPDFKey, btn, pdf);
 }
 
-// ===== Smart Page Loading =====
+// ===== 智能页面加载 =====
+
+/**
+ * 加载指定页面，根据导航方式选择不同的加载策略
+ * @param {number} page - 目标页码
+ * @param {string} direction - 'next' 下一页（叠加滑动）、'prev' 上一页（叠加滑动）、'fade' 跳转（直接替换）
+ *
+ * 智能加载逻辑：
+ * 1. requestID 机制：每次加载递增 ID，过时的 onload 回调被丢弃
+ * 2. preloadedPages 集合：已加载的页面 URL 被记录，命中时跳过 loader 动画
+ * 3. 预加载：延迟 200ms 后预加载相邻页面，若用户已翻走则取消
+ */
 function loadPage(page, direction) {
     if (page < 1 || page > pageCount) return;
+    const myID = ++requestID; // 本次加载的唯一标识
+    const isSequential = direction === 'next' || direction === 'prev';
 
-    const myID = ++requestID;
+    // 更新 UI 状态
     currentPage = page;
     $('page-input').value = page;
     $('prev-btn').disabled = page <= 1;
     $('next-btn').disabled = page >= pageCount;
+    localStorage.setItem(`pdf-${currentPDFKey}-page`, page); // 保存阅读位置
+    history.replaceState(null, '', `#/read/${currentPDFKey}/${page}`); // 更新 URL（不产生历史记录）
+    resetZoom(); // 翻页时重置缩放
 
-    localStorage.setItem(`pdf-${currentPDFKey}-page`, page);
-    history.replaceState(null, '', `#/read/${currentPDFKey}/${page}`);
+    // 顺序翻页时检查跳转历史范围
+    if (isSequential) checkJumpRange();
+    updateJumpButtons();
 
-    const img = $('page-img');
-    const loader = $('page-loader');
+    const url = pageURL(page);
+    const isPreloaded = preloadedPages.has(url);
 
-    loader.classList.remove('hidden');
-    img.style.opacity = '0';
+    // 根据导航方式选择加载策略
+    if (isSequential) {
+        slidePage(url, direction, myID, isPreloaded); // 叠加层滑动动画
+    } else {
+        swapPage(url, myID, isPreloaded); // 直接替换（无动画）
+    }
 
-    img.onload = () => {
-        if (myID !== requestID) return;
-        loader.classList.add('hidden');
-        img.classList.remove('enter', 'enter-left', 'enter-right');
-        void img.offsetWidth;
-        if (direction === 'next') img.classList.add('enter-right');
-        else if (direction === 'prev') img.classList.add('enter-left');
-        else img.classList.add('enter');
-        img.style.opacity = '';
-    };
-    img.onerror = () => {
-        if (myID !== requestID) return;
-        loader.querySelector('span').textContent = '加载失败，点击重试';
-    };
-
-    img.src = `/api/pdfs/${currentPDFKey}/page/${page}?t=${Date.now()}`;
-
+    // 智能预加载：延迟 200ms，确保用户停在此页后才预加载相邻页
     setTimeout(() => {
-        if (myID !== requestID) return;
-        if (page < pageCount) {
-            new Image().src = `/api/pdfs/${currentPDFKey}/page/${page + 1}`;
+        if (myID !== requestID) return; // 用户已翻走，取消预加载
+        // 预加载后 2 页
+        for (let p = page + 1; p <= Math.min(page + 2, pageCount); p++) {
+            const u = pageURL(p);
+            if (!preloadedPages.has(u)) {
+                const pre = new Image();
+                pre.onload = () => preloadedPages.add(u);
+                pre.src = u;
+            }
         }
+        // 预加载前 1 页
         if (page > 1) {
-            new Image().src = `/api/pdfs/${currentPDFKey}/page/${page - 1}`;
+            const u = pageURL(page - 1);
+            if (!preloadedPages.has(u)) {
+                const pre = new Image();
+                pre.onload = () => preloadedPages.add(u);
+                pre.src = u;
+            }
         }
     }, 200);
 }
 
+/**
+ * 直接替换页面（用于页码跳转，无动画）
+ * 如果页面已预加载，立即设置；否则显示加载动画，等待加载完成
+ */
+function swapPage(url, myID, isPreloaded) {
+    const base = $('page-base');
+    const loader = $('page-loader');
+    const finish = () => {
+        if (myID !== requestID) return; // 过时请求，丢弃
+        preloadedPages.add(url);
+        loader.classList.add('hidden');
+        base.src = url;
+    };
+    if (isPreloaded) {
+        finish();
+    } else {
+        loader.classList.remove('hidden');
+        loader.querySelector('span').textContent = '渲染中...';
+        const pre = new Image();
+        pre.onload = finish;
+        pre.onerror = () => { if (myID === requestID) loader.querySelector('span').textContent = '加载失败'; };
+        pre.src = url;
+    }
+}
+
+/**
+ * 叠加层滑动翻页动画
+ * 使用两个图片层：base-wrapper（底层，当前页）和 overlay-wrapper（顶层，用于动画）
+ *
+ * 向前翻页（next）：
+ *   1. 将新页加载到 overlay 层
+ *   2. overlay 从右侧(translateX(100%))滑入覆盖 base
+ *   3. 动画结束后将 overlay 的 src 复制到 base，隐藏 overlay
+ *
+ * 向后翻页（prev）：
+ *   1. 将当前页复制到 overlay 层（覆盖在 base 之上）
+ *   2. 将上一页加载到 base 层（被 overlay 遮挡，不可见）
+ *   3. overlay 向右滑出(translateX(100%))，露出 base 中的上一页
+ *   4. 动画结束后隐藏 overlay
+ *
+ * 旧页面在加载和动画期间始终保持可见，避免闪烁
+ */
+function slidePage(url, direction, myID, isPreloaded) {
+    const base = $('page-base');
+    const overlay = $('page-overlay');
+    const ow = $('overlay-wrapper');
+    const loader = $('page-loader');
+
+    if (direction === 'next') {
+        // === 向前翻页：新页从右侧滑入覆盖旧页 ===
+        const startSlide = () => {
+            if (myID !== requestID) return;
+            preloadedPages.add(url);
+            loader.classList.add('hidden');
+            overlay.src = url;
+            ow.style.display = '';                      // 显示叠加层
+            ow.style.transition = 'none';               // 先禁用动画
+            ow.style.transform = 'translateX(100%)';    // 定位到右侧屏外
+            requestAnimationFrame(() => {
+                if (myID !== requestID) return;
+                ow.style.transition = 'transform 0.2s ease-out'; // 启用动画
+                ow.style.transform = 'translateX(0)';            // 滑入
+            });
+            // 动画结束后：将新页 src 复制到 base，隐藏 overlay
+            setTimeout(() => {
+                if (myID !== requestID) return;
+                base.src = url;
+                ow.style.display = 'none';
+                ow.style.transition = '';
+                ow.style.transform = '';
+            }, 220);
+        };
+        if (isPreloaded) { startSlide(); }
+        else {
+            loader.classList.remove('hidden');
+            loader.querySelector('span').textContent = '渲染中...';
+            const pre = new Image();
+            pre.onload = startSlide;
+            pre.onerror = () => { if (myID === requestID) loader.querySelector('span').textContent = '加载失败'; };
+            pre.src = url;
+        }
+    } else {
+        // === 向后翻页：当前页向右滑出，露出上一页 ===
+        overlay.src = base.src; // 将当前页复制到叠加层
+        ow.style.display = '';
+        ow.style.transition = 'none';
+        ow.style.transform = 'translateX(0)'; // 叠加层覆盖在 base 之上
+
+        const startSlide = () => {
+            if (myID !== requestID) return;
+            preloadedPages.add(url);
+            loader.classList.add('hidden');
+            base.src = url; // 将上一页加载到底层（被 overlay 遮挡，不可见）
+            requestAnimationFrame(() => {
+                if (myID !== requestID) return;
+                ow.style.transition = 'transform 0.2s ease-out';
+                ow.style.transform = 'translateX(100%)'; // 叠加层向右滑出
+            });
+            // 动画结束后隐藏叠加层
+            setTimeout(() => {
+                if (myID !== requestID) return;
+                ow.style.display = 'none';
+                ow.style.transition = '';
+                ow.style.transform = '';
+            }, 220);
+        };
+        if (isPreloaded) { startSlide(); }
+        else {
+            loader.classList.remove('hidden');
+            loader.querySelector('span').textContent = '渲染中...';
+            const pre = new Image();
+            pre.onload = startSlide;
+            pre.onerror = () => { if (myID === requestID) loader.querySelector('span').textContent = '加载失败'; };
+            pre.src = url;
+        }
+    }
+}
+
+// ===== 跳转历史 =====
+
+/**
+ * 记录一次页码跳转
+ * @param {number} fromPage - 跳转前的页码
+ * @param {number} toPage - 跳转后的页码
+ * 设置 jumpBack = { target: fromPage, anchor: toPage }，清除 jumpForward
+ */
+function recordJump(fromPage, toPage) {
+    if (fromPage === toPage) return;
+    jumpBack = { target: fromPage, anchor: toPage };
+    jumpForward = null;
+    updateJumpButtons();
+}
+
+/**
+ * 检查跳转历史是否在有效范围内
+ * 当当前页与锚点页相差超过 10 页时，清除对应方向的跳转记录
+ * 仅在顺序翻页（next/prev）时调用
+ */
+function checkJumpRange() {
+    if (jumpBack && Math.abs(currentPage - jumpBack.anchor) > 10) jumpBack = null;
+    if (jumpForward && Math.abs(currentPage - jumpForward.anchor) > 10) jumpForward = null;
+}
+
+/** 根据跳转历史状态启用/禁用箭头按钮 */
+function updateJumpButtons() {
+    $('jump-back-btn').disabled = !jumpBack;
+    $('jump-forward-btn').disabled = !jumpForward;
+}
+
+/** 点击向后跳转箭头：跳转到 jumpBack.target，并将当前页记入 jumpForward */
+function clickJumpBack() {
+    if (!jumpBack) return;
+    jumpForward = { target: currentPage, anchor: jumpBack.target };
+    const target = jumpBack.target;
+    jumpBack = null;
+    loadPage(target, 'fade');
+    updateJumpButtons();
+}
+
+/** 点击向前跳转箭头：跳转到 jumpForward.target，并将当前页记入 jumpBack */
+function clickJumpForward() {
+    if (!jumpForward) return;
+    jumpBack = { target: currentPage, anchor: jumpForward.target };
+    const target = jumpForward.target;
+    jumpForward = null;
+    loadPage(target, 'fade');
+    updateJumpButtons();
+}
+
+/**
+ * 跳转到指定页码（通过页码输入框或首页按钮触发）
+ * 会记录跳转历史，使用 'fade' 方式加载（无滑动动画）
+ */
+function jumpToPage(page) {
+    if (page < 1 || page > pageCount || page === currentPage) return;
+    recordJump(currentPage, page);
+    loadPage(page, 'fade');
+}
+
+// ===== 导航 =====
+
+/** 上一页（顺序导航，使用滑动动画） */
 function goPrev() { if (currentPage > 1) loadPage(currentPage - 1, 'prev'); }
+/** 下一页（顺序导航，使用滑动动画） */
 function goNext() { if (currentPage < pageCount) loadPage(currentPage + 1, 'next'); }
 
-// ===== Navigation =====
+// 返回按钮 -> 导航到 PDF 所在的文件夹
 $('back-btn').addEventListener('click', () => {
     location.hash = currentPDFFolder ? '#/folder/' + encodeURIComponent(currentPDFFolder) : '#/';
 });
-
 $('prev-btn').addEventListener('click', goPrev);
 $('next-btn').addEventListener('click', goNext);
+$('jump-back-btn').addEventListener('click', clickJumpBack);
+$('jump-forward-btn').addEventListener('click', clickJumpForward);
+// 首页按钮 -> 跳转到第1页（计入跳转历史）
+$('home-btn').addEventListener('click', () => jumpToPage(1));
 
+// 页码输入框 -> 跳转到输入的页码
 $('page-input').addEventListener('change', e => {
     const page = parseInt(e.target.value);
-    if (page >= 1 && page <= pageCount) {
-        loadPage(page, 'fade');
-    } else {
-        e.target.value = currentPage;
-    }
+    if (page >= 1 && page <= pageCount) jumpToPage(page);
+    else e.target.value = currentPage;
 });
 
+// 左右点击区域（仅在未缩放时翻页）
 $('tap-left').addEventListener('click', () => { if (zoom === 1) goPrev(); });
 $('tap-right').addEventListener('click', () => { if (zoom === 1) goNext(); });
 
+// 键盘导航（桌面端）
 document.addEventListener('keydown', e => {
     if ($('reader').classList.contains('hidden')) return;
     if (e.key === 'ArrowLeft') goPrev();
     if (e.key === 'ArrowRight' || e.key === ' ') { e.preventDefault(); goNext(); }
 });
 
-// ===== Swipe (only when not zoomed) =====
-let swipeStartX = 0, swipeStartY = 0;
+// ===== 滑动手势（仅在未缩放时生效）=====
+// 记录触摸起始位置
 $('page-area').addEventListener('touchstart', e => {
     if (e.touches.length === 1 && zoom === 1) {
         swipeStartX = e.touches[0].clientX;
@@ -445,81 +685,285 @@ $('page-area').addEventListener('touchstart', e => {
     }
 }, { passive: true });
 
+// 触摸结束时判断是否为有效的滑动手势（水平位移 > 60px 且水平位移 > 垂直位移的 2 倍）
 $('page-area').addEventListener('touchend', e => {
     if (zoom !== 1) return;
+    if (e.changedTouches.length !== 1) return;
     const dx = e.changedTouches[0].clientX - swipeStartX;
     const dy = e.changedTouches[0].clientY - swipeStartY;
     if (Math.abs(dx) > 60 && Math.abs(dx) > Math.abs(dy) * 2) {
-        if (dx > 0) goPrev();
-        else goNext();
+        if (dx > 0) goPrev(); else goNext();
     }
 }, { passive: true });
 
-// ===== Pinch-to-Zoom =====
+// ===== 缩放系统 =====
+
+/**
+ * 计算两指之间的距离（用于 pinch 缩放比例计算）
+ * @param {TouchList} touches - 触摸点列表，需要恰好 2 个
+ * @returns {number} 两指间距离（像素）
+ */
 function getTouchDist(touches) {
     const dx = touches[0].clientX - touches[1].clientX;
     const dy = touches[0].clientY - touches[1].clientY;
     return Math.sqrt(dx * dx + dy * dy);
 }
 
-function applyZoom() {
-    const img = $('page-img');
-    img.style.transform = `scale(${zoom}) translate(${panX / zoom}px, ${panY / zoom}px)`;
-    $('page-area').style.overflow = zoom > 1 ? 'auto' : 'hidden';
+/**
+ * 将屏幕触摸坐标转换为相对图片左上角的焦点坐标
+ * 用于缩放时确定以哪个点为中心进行缩放
+ * @returns {{x: number, y: number}} 焦点坐标（相对图片自然位置）
+ */
+function getFocalPoint(touchX, touchY) {
+    const img = $('page-base');
+    const area = $('page-area');
+    const areaRect = area.getBoundingClientRect();
+    // offsetLeft/offsetTop 是图片在 page-area 中的自然位置（不受 transform 影响）
+    return {
+        x: touchX - areaRect.left - img.offsetLeft,
+        y: touchY - areaRect.top - img.offsetTop
+    };
 }
 
+/** 将当前 zoom/pan 状态应用为 CSS transform */
+function applyTransform() {
+    // transform-origin: 0 0（在 CSS 中设置），所以变换从图片左上角开始
+    // 顺序：先平移再缩放 -> translate(panX, panY) scale(zoom)
+    $('page-base').style.transform = `translate(${panX}px, ${panY}px) scale(${zoom})`;
+}
+
+/** 重置缩放和平移到初始状态（zoom=1, pan=0） */
 function resetZoom() {
     zoom = 1; panX = 0; panY = 0;
-    $('page-img').style.transform = '';
-    $('page-area').style.overflow = 'hidden';
+    $('page-base').style.transform = '';
+    $('page-base').classList.remove('smooth');
+    $('page-overlay').style.transform = '';
 }
 
+/**
+ * 以指定焦点为中心进行缩放
+ * 核心公式：newPan = focal - (focal - oldPan) * (newZoom / oldZoom)
+ * 这个公式保证焦点位置在缩放前后保持不变（跟手）
+ * @param {number} focalX - 焦点 X 坐标（相对图片自然位置）
+ * @param {number} focalY - 焦点 Y 坐标
+ * @param {number} newZoom - 目标缩放倍率（会被 clamp 到 1~4）
+ */
+function zoomAt(focalX, focalY, newZoom) {
+    newZoom = Math.min(4, Math.max(1, newZoom));
+    if (newZoom === zoom) return;
+    panX = focalX - (focalX - panX) * (newZoom / zoom);
+    panY = focalY - (focalY - panY) * (newZoom / zoom);
+    zoom = newZoom;
+    if (zoom === 1) { panX = 0; panY = 0; } // 缩放到 1x 时自动归位
+    applyTransform();
+}
+
+/**
+ * 带平滑过渡的缩放（用于横向滚轮缩放）
+ * 添加 CSS transition 类，200ms 后移除
+ */
+function smoothZoomAt(focalX, focalY, newZoom) {
+    const img = $('page-base');
+    img.classList.add('smooth');
+    zoomAt(focalX, focalY, newZoom);
+    setTimeout(() => img.classList.remove('smooth'), 200);
+}
+
+// ===== 触摸事件：双指缩放 + 单指平移 =====
+
+// touchstart：根据触摸点数量初始化缩放或平移
 $('page-area').addEventListener('touchstart', e => {
-    const now = Date.now();
-    if (e.touches.length === 1) {
-        if (now - lastTapTime < 300) {
-            zoom = zoom > 1 ? 1 : 2;
-            panX = 0; panY = 0;
-            applyZoom();
-            if (zoom === 1) resetZoom();
-        }
-        lastTapTime = now;
-    }
     if (e.touches.length === 2) {
-        lastTouchDist = getTouchDist(e.touches);
+        // 双指触摸 -> 初始化 pinch 缩放
         e.preventDefault();
+        const mid = { x: (e.touches[0].clientX + e.touches[1].clientX) / 2, y: (e.touches[0].clientY + e.touches[1].clientY) / 2 };
+        const focal = getFocalPoint(mid.x, mid.y);
+        pinchStartDist = getTouchDist(e.touches);  // 记录初始两指距离
+        pinchStartFocal = focal;                     // 记录初始焦点
+        pinchStartZoom = zoom;                       // 记录初始缩放倍率
+        pinchStartPanX = panX;                       // 记录初始平移
+        pinchStartPanY = panY;
+    } else if (e.touches.length === 1) {
+        // 单指触摸 -> 初始化平移
+        panStartX = e.touches[0].clientX;
+        panStartY = e.touches[0].clientY;
+        panOrigX = panX; // 记录平移起始时的 pan 值
+        panOrigY = panY;
     }
 }, { passive: false });
 
+// touchmove：根据触摸点数量执行缩放或平移
 $('page-area').addEventListener('touchmove', e => {
-    if (e.touches.length === 2) {
+    if (e.touches.length === 2 && pinchStartDist > 0) {
+        // === 双指缩放 + 双指平移 ===
         e.preventDefault();
         const dist = getTouchDist(e.touches);
-        if (lastTouchDist > 0) {
-            const ratio = dist / lastTouchDist;
-            zoom = Math.min(4, Math.max(1, zoom * ratio));
-            if (zoom === 1) { panX = 0; panY = 0; }
-            applyZoom();
-        }
-        lastTouchDist = dist;
+        const mid = { x: (e.touches[0].clientX + e.touches[1].clientX) / 2, y: (e.touches[0].clientY + e.touches[1].clientY) / 2 };
+        const currFocal = getFocalPoint(mid.x, mid.y);
+        // 根据两指距离比计算新缩放倍率
+        const newZoom = Math.min(4, Math.max(1, pinchStartZoom * dist / pinchStartDist));
+        // 以初始焦点为中心进行缩放（焦点位置保持不变）
+        panX = pinchStartFocal.x - (pinchStartFocal.x - pinchStartPanX) * (newZoom / pinchStartZoom);
+        panY = pinchStartFocal.y - (pinchStartFocal.y - pinchStartPanY) * (newZoom / pinchStartZoom);
+        // 叠加双指平移（两指中点移动量）
+        panX += currFocal.x - pinchStartFocal.x;
+        panY += currFocal.y - pinchStartFocal.y;
+        zoom = newZoom;
+        if (zoom === 1) { panX = 0; panY = 0; }
+        applyTransform();
     } else if (e.touches.length === 1 && zoom > 1) {
+        // === 单指平移（仅在缩放状态下生效）===
         e.preventDefault();
-        const dx = e.touches[0].clientX - touchStartX;
-        const dy = e.touches[0].clientY - touchStartY;
-        panX += dx;
-        panY += dy;
-        touchStartX = e.touches[0].clientX;
-        touchStartY = e.touches[0].clientY;
-        applyZoom();
-    } else if (e.touches.length === 1 && zoom === 1) {
-        touchStartX = e.touches[0].clientX;
-        touchStartY = e.touches[0].clientY;
+        panX = panOrigX + (e.touches[0].clientX - panStartX);
+        panY = panOrigY + (e.touches[0].clientY - panStartY);
+        applyTransform();
     }
 }, { passive: false });
 
+// touchend：处理从双指到单指的过渡
 $('page-area').addEventListener('touchend', e => {
-    if (e.touches.length < 2) lastTouchDist = 0;
+    // 当从双指变为单指时，重置单指平移的起始位置和原始 pan 值
+    // 防止松开一指后页面跳偏（因为 panOrigX/Y 还是双指开始前的旧值）
+    if (e.touches.length === 1 && pinchStartDist > 0) {
+        panStartX = e.touches[0].clientX;
+        panStartY = e.touches[0].clientY;
+        panOrigX = panX;
+        panOrigY = panY;
+    }
+    if (e.touches.length < 2) pinchStartDist = 0;
 }, { passive: true });
 
-// ===== Init =====
+// ===== 横向滚轮缩放 =====
+// 横向滚轮向右 -> 放大，向左 -> 缩小，以鼠标位置为焦点
+$('page-area').addEventListener('wheel', e => {
+    if (e.deltaX === 0) return; // 只处理横向滚轮
+    e.preventDefault();
+    const focal = getFocalPoint(e.clientX, e.clientY);
+    const factor = e.deltaX > 0 ? 1.15 : 0.87; // 右滚放大15%，左滚缩小13%
+    smoothZoomAt(focal.x, focal.y, zoom * factor);
+}, { passive: false });
+
+// ===== 目录与标记侧边栏 =====
+
+/** 打开侧边栏：移除 hidden 类，下一帧添加 open 类触发滑入动画 */
+function openMarksSidebar() {
+    $('marks-sidebar').classList.remove('hidden');
+    $('marks-backdrop').classList.remove('hidden');
+    requestAnimationFrame(() => {
+        $('marks-sidebar').classList.add('open');
+        $('marks-backdrop').classList.add('open');
+    });
+    loadMarks();
+}
+
+/** 关闭侧边栏：移除 open 类触发滑出动画，200ms 后添加 hidden 类 */
+function closeMarksSidebar() {
+    $('marks-sidebar').classList.remove('open');
+    $('marks-backdrop').classList.remove('open');
+    setTimeout(() => {
+        $('marks-sidebar').classList.add('hidden');
+        $('marks-backdrop').classList.add('hidden');
+    }, 200);
+}
+
+/** 从后端加载当前 PDF 的目录和标记列表 */
+async function loadMarks() {
+    const list = $('marks-list');
+    list.innerHTML = '<div class="marks-empty">加载中...</div>';
+    try {
+        const marks = await apiJSON(`/api/pdfs/${currentPDFKey}/marks`);
+        renderMarks(marks || []);
+    } catch (e) {
+        list.innerHTML = '<div class="marks-empty">加载失败</div>';
+    }
+}
+
+/**
+ * 渲染标记列表
+ * 分两部分：PDF目录（is_outline=true，只读）和我的标记（is_outline=false，可删除）
+ * 点击任意标记 -> 关闭侧边栏并跳转到对应页面
+ */
+function renderMarks(marks) {
+    const list = $('marks-list');
+    if (marks.length === 0) {
+        list.innerHTML = '<div class="marks-empty">暂无目录或标记<br>可在下方添加自定义标记</div>';
+        return;
+    }
+    const outline = marks.filter(m => m.is_outline);
+    const userMarks = marks.filter(m => !m.is_outline);
+    let html = '';
+    // PDF目录部分（按层级缩进显示）
+    if (outline.length > 0) {
+        html += '<div class="marks-section">PDF目录</div>';
+        for (const m of outline) {
+            const indent = m.level * 16; // 每级缩进 16px
+            html += `<div class="mark-item" data-page="${m.page_num}" style="padding-left:${8 + indent}px">
+                <span class="mark-title">${escapeHtml(m.title)}</span><span class="mark-page">${m.page_num}</span></div>`;
+        }
+    }
+    // 用户自定义标记部分（可删除）
+    if (userMarks.length > 0) {
+        html += '<div class="marks-section">我的标记</div>';
+        for (const m of userMarks) {
+            html += `<div class="mark-item" data-page="${m.page_num}" data-id="${m.id}">
+                <span class="mark-title">${escapeHtml(m.title)}</span><span class="mark-page">${m.page_num}</span>
+                <button class="mark-delete" data-id="${m.id}" aria-label="删除">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg>
+                </button></div>`;
+        }
+    }
+    list.innerHTML = html;
+    // 绑定点击事件：跳转到对应页面
+    list.querySelectorAll('.mark-item').forEach(el => {
+        el.addEventListener('click', e => {
+            if (e.target.closest('.mark-delete')) return; // 点击的是删除按钮
+            const page = parseInt(el.dataset.page);
+            closeMarksSidebar();
+            setTimeout(() => loadPage(page, 'fade'), 100); // 等侧边栏开始关闭后再翻页
+        });
+    });
+    // 绑定删除按钮事件
+    list.querySelectorAll('.mark-delete').forEach(btn => {
+        btn.addEventListener('click', e => {
+            e.stopPropagation();
+            deleteMark(parseInt(btn.dataset.id));
+        });
+    });
+}
+
+/** 删除一个用户自定义标记 */
+async function deleteMark(id) {
+    try {
+        await api(`/api/pdfs/${currentPDFKey}/marks/${id}`, { method: 'DELETE' });
+        loadMarks(); // 刷新列表
+        showToast('已删除');
+    } catch (e) { showToast('删除失败'); }
+}
+
+// 侧边栏事件绑定
+$('marks-btn').addEventListener('click', openMarksSidebar);
+$('marks-close').addEventListener('click', closeMarksSidebar);
+$('marks-backdrop').addEventListener('click', closeMarksSidebar);
+
+// 添加标记按钮
+$('mark-add-btn').addEventListener('click', () => {
+    const input = $('mark-title-input');
+    const title = input.value.trim();
+    if (!title) return;
+    api(`/api/pdfs/${currentPDFKey}/marks`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ page: currentPage, title })
+    }).then(() => {
+        input.value = '';
+        loadMarks();
+        showToast('已添加标记');
+    }).catch(() => showToast('添加失败'));
+});
+// 输入框按 Enter 也触发添加
+$('mark-title-input').addEventListener('keydown', e => {
+    if (e.key === 'Enter') $('mark-add-btn').click();
+});
+
+// ===== 初始化 =====
 loadLibrary();

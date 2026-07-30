@@ -1,3 +1,11 @@
+// 数据库层包
+// 封装 SQLite 数据库操作，提供 PDF 记录和页面标记的 CRUD 方法
+// 使用 modernc.org/sqlite（纯Go实现，无需CGO）作为 SQLite 驱动
+// 数据库采用 WAL 模式提高并发读写性能
+//
+// 表结构：
+//   pdfs        - PDF 文件记录（路径、页数、缓存状态等）
+//   page_marks  - 页面标记（PDF自带目录 + 用户自定义标记）
 package db
 
 import (
@@ -8,6 +16,8 @@ import (
 
 	_ "modernc.org/sqlite"
 )
+
+
 
 type Database struct {
 	*sql.DB
@@ -69,6 +79,17 @@ func migrate(db *sql.DB) error {
 		CREATE INDEX IF NOT EXISTS idx_pdfs_deleted ON pdfs(deleted);
 		CREATE INDEX IF NOT EXISTS idx_pdfs_cache_lru ON pdfs(cache_last_access) WHERE cache_active = 0 AND cached_pages > 0 AND deleted = 0;
 		CREATE INDEX IF NOT EXISTS idx_pdfs_cache_key ON pdfs(cache_key) WHERE deleted = 0;
+		CREATE TABLE IF NOT EXISTS page_marks (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			pdf_id INTEGER NOT NULL,
+			page_num INTEGER NOT NULL,
+			title TEXT NOT NULL,
+			level INTEGER NOT NULL DEFAULT 0,
+			is_outline INTEGER NOT NULL DEFAULT 0,
+			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+			FOREIGN KEY (pdf_id) REFERENCES pdfs(id)
+		);
+		CREATE INDEX IF NOT EXISTS idx_marks_pdf ON page_marks(pdf_id);
 	`)
 	return err
 }
@@ -280,4 +301,67 @@ func (db *Database) GetCacheStatus(id int64) (*models.CacheStatus, error) {
 		CacheSize:  cacheSize / (1024 * 1024),
 		Rebuilding: rebuilding == 1,
 	}, nil
+}
+
+func (db *Database) ListMarks(pdfID int64) ([]*models.PageMark, error) {
+	rows, err := db.Query(`
+		SELECT id, page_num, title, level, is_outline FROM page_marks
+		WHERE pdf_id = ? ORDER BY is_outline DESC, page_num ASC, id ASC
+	`, pdfID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var marks []*models.PageMark
+	for rows.Next() {
+		m := &models.PageMark{}
+		var isOutline int
+		if err := rows.Scan(&m.ID, &m.PageNum, &m.Title, &m.Level, &isOutline); err != nil {
+			return nil, err
+		}
+		m.IsOutline = isOutline == 1
+		marks = append(marks, m)
+	}
+	return marks, rows.Err()
+}
+
+func (db *Database) AddMark(pdfID int64, pageNum int, title string) (int64, error) {
+	res, err := db.Exec(`INSERT INTO page_marks (pdf_id, page_num, title, is_outline) VALUES (?, ?, ?, 0)`,
+		pdfID, pageNum, title)
+	if err != nil {
+		return 0, err
+	}
+	return res.LastInsertId()
+}
+
+func (db *Database) DeleteMark(markID, pdfID int64) error {
+	_, err := db.Exec(`DELETE FROM page_marks WHERE id = ? AND pdf_id = ? AND is_outline = 0`, markID, pdfID)
+	return err
+}
+
+func (db *Database) HasOutlineMarks(pdfID int64) (bool, error) {
+	var count int
+	err := db.QueryRow(`SELECT COUNT(*) FROM page_marks WHERE pdf_id = ? AND is_outline = 1`, pdfID).Scan(&count)
+	return count > 0, err
+}
+
+func (db *Database) DeleteOutlineMarks(pdfID int64) error {
+	_, err := db.Exec(`DELETE FROM page_marks WHERE pdf_id = ? AND is_outline = 1`, pdfID)
+	return err
+}
+
+func (db *Database) AddOutlineMarks(pdfID int64, entries []models.OutlineEntry) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	for _, e := range entries {
+		if _, err := tx.Exec(`INSERT INTO page_marks (pdf_id, page_num, title, level, is_outline) VALUES (?, ?, ?, ?, 1)`,
+			pdfID, e.Page, e.Title, e.Level); err != nil {
+			tx.Rollback()
+			return err
+		}
+	}
+	return tx.Commit()
 }

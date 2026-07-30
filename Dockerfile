@@ -6,7 +6,7 @@ COPY . .
 RUN CGO_ENABLED=0 go build -o note-web -ldflags="-s -w" .
 
 FROM alpine:3.20
-RUN apk add --no-cache poppler-utils
+RUN apk add --no-cache poppler-utils mupdf-tools
 COPY --from=builder /app/note-web /usr/local/bin/
 EXPOSE 8080
 VOLUME ["/data"]
