@@ -78,8 +78,28 @@
     </div>
     <div id="marks-list" class="marks-list"></div>
     <div class="marks-add">
+        <button id="batch-add-btn" class="batch-btn" aria-label="批量添加">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg>
+        </button>
         <input type="text" id="mark-title-input" placeholder="标记当前页..." maxlength="50">
         <button id="mark-add-btn" class="mark-add-btn" aria-label="添加">+</button>
+    </div>
+</div>
+
+<div id="batch-modal" class="batch-modal hidden">
+    <div class="batch-modal-content">
+        <div class="batch-modal-header">
+            <h3>批量添加目录</h3>
+            <button id="batch-close" class="icon-btn" aria-label="关闭">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6L6 18M6 6l12 12"/></svg>
+            </button>
+        </div>
+        <p class="batch-hint">每行一个，格式：标题 -- 页码</p>
+        <textarea id="batch-input" class="batch-input" placeholder="1 呼吸 -- 1&#10;1.1 肺通气 -- 3&#10;1.2 气体交换 -- 5&#10;2 循环 -- 10&#10;附录 -- 0"></textarea>
+        <div class="batch-actions">
+            <button id="batch-cancel" class="batch-cancel-btn">取消</button>
+            <button id="batch-confirm" class="batch-confirm-btn">添加</button>
+        </div>
     </div>
 </div>
 

@@ -25,6 +25,7 @@ import (
 	"io/fs"
 	"log"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -68,6 +69,8 @@ func (s *Server) Start() error {
 	mux.HandleFunc("GET /api/pdfs/{key}/marks", s.handleListMarks)
 	mux.HandleFunc("POST /api/pdfs/{key}/marks", s.handleAddMark)
 	mux.HandleFunc("DELETE /api/pdfs/{key}/marks/{markId}", s.handleDeleteMark)
+	mux.HandleFunc("PUT /api/pdfs/{key}/marks/reorder", s.handleReorderMarks)
+	mux.HandleFunc("POST /api/pdfs/{key}/marks/batch", s.handleBatchAddMarks)
 	mux.HandleFunc("POST /api/pdfs/{key}/outline", s.handleExtractOutline)
 
 	fsys, err := fs.Sub(s.webFS, "web")
@@ -332,17 +335,78 @@ func (s *Server) handleAddMark(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "invalid request body")
 		return
 	}
-	if body.Title == "" || body.Page < 1 || body.Page > pdf.PageCount {
-		writeError(w, 400, "invalid page or title")
+	if body.Title == "" {
+		writeError(w, 400, "title is required")
+		return
+	}
+	if body.Page < 0 || body.Page > pdf.PageCount {
+		writeError(w, 400, "invalid page")
 		return
 	}
 
-	id, err := s.db.AddMark(pdf.ID, body.Page, body.Title)
+	// 自动归类：解析标题中的编号模式
+	displayTitle, parentID, level := classifyTitle(body.Title, nil)
+
+	// 如果自动归类未找到父级，尝试从已有标记中查找
+	if parentID == 0 {
+		existing, _ := s.db.ListMarks(pdf.ID)
+		displayTitle, parentID, level = classifyTitle(body.Title, existing)
+	}
+
+	// 排序值：追加到末尾
+	maxOrder, _ := s.db.GetMaxSortOrder(pdf.ID)
+	sortOrder := maxOrder + 1
+
+	id, err := s.db.AddMark(pdf.ID, body.Page, displayTitle, parentID, level, sortOrder)
 	if err != nil {
 		writeError(w, 500, "failed to add mark")
 		return
 	}
-	writeJSON(w, 200, map[string]interface{}{"id": id, "status": "added"})
+	writeJSON(w, 200, map[string]interface{}{"id": id, "status": "added", "title": displayTitle, "parent_id": parentID, "level": level})
+}
+
+// classifyTitle 解析标题中的编号模式，自动确定父子关系
+// 规则：
+//   - 标题包含 "/." -> 转义，将 "/." 替换为 "."，不自动归类（level=0, parentID=0）
+//   - 标题以 "数字.数字..." 开头 -> 自动归类为父编号的子项
+//     例如 "1.5 引言" -> 父编号 "1"，在已有标记中查找标题以 "1" 开头的标记作为父级
+//   - 其他标题 -> 顶级（level=0, parentID=0）
+func classifyTitle(title string, existing []*models.PageMark) (displayTitle string, parentID int64, level int) {
+	// 转义检查：/. -> . ，不自动归类
+	if strings.Contains(title, "/.") {
+		displayTitle = strings.ReplaceAll(title, "/.", ".")
+		return displayTitle, 0, 0
+	}
+
+	// 匹配编号前缀：如 "1", "1.5", "1.5.3"
+	numRe := regexp.MustCompile(`^(\d+)((?:\.\d+)*)`)
+	match := numRe.FindStringSubmatch(title)
+	if match == nil {
+		return title, 0, 0
+	}
+
+	fullPrefix := match[0] // 如 "1.5"
+	// 如果只有一个数字（没有点），是顶级
+	if match[2] == "" {
+		return title, 0, 0
+	}
+
+	// 提取父前缀：最后一个点之前的部分
+	lastDot := strings.LastIndex(fullPrefix, ".")
+	parentPrefix := fullPrefix[:lastDot] // 如 "1"
+
+	// 在已有标记中查找父前缀匹配的标记
+	if existing != nil {
+		for _, m := range existing {
+			mMatch := numRe.FindString(m.Title)
+			if mMatch == parentPrefix {
+				return title, m.ID, m.Level + 1
+			}
+		}
+	}
+
+	// 未找到父级，作为顶级
+	return title, 0, 0
 }
 
 func (s *Server) handleDeleteMark(w http.ResponseWriter, r *http.Request) {
@@ -364,6 +428,96 @@ func (s *Server) handleDeleteMark(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, map[string]string{"status": "deleted"})
+}
+
+// handleReorderMarks 批量更新标记的排序和父子关系（用于拖拽排序）
+func (s *Server) handleReorderMarks(w http.ResponseWriter, r *http.Request) {
+	key := r.PathValue("key")
+	pdf, err := s.db.GetPDFByCacheKey(key)
+	if err != nil || pdf.Deleted {
+		writeError(w, 404, "PDF not found")
+		return
+	}
+
+	var items []db.ReorderItem
+	if err := json.NewDecoder(r.Body).Decode(&items); err != nil {
+		writeError(w, 400, "invalid request body")
+		return
+	}
+
+	if err := s.db.ReorderMarks(pdf.ID, items); err != nil {
+		writeError(w, 500, "failed to reorder marks")
+		return
+	}
+	writeJSON(w, 200, map[string]string{"status": "reordered"})
+}
+
+// handleBatchAddMarks 批量添加标记
+// 请求体：[{title: "1 呼吸", page: 1}, {title: "1.1 肺通气", page: 3}, ...]
+// 按顺序逐个处理，自动归类（前一个条目可作为后一个的父级）
+func (s *Server) handleBatchAddMarks(w http.ResponseWriter, r *http.Request) {
+	key := r.PathValue("key")
+	pdf, err := s.db.GetPDFByCacheKey(key)
+	if err != nil || pdf.Deleted {
+		writeError(w, 404, "PDF not found")
+		return
+	}
+
+	var input []struct {
+		Title string `json:"title"`
+		Page  int    `json:"page"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+		writeError(w, 400, "invalid request body")
+		return
+	}
+	if len(input) == 0 {
+		writeError(w, 400, "empty batch")
+		return
+	}
+
+	// 获取已有标记（用于查找父级）
+	existing, _ := s.db.ListMarks(pdf.ID)
+	allMarks := make([]*models.PageMark, len(existing))
+	copy(allMarks, existing)
+
+	maxOrder, _ := s.db.GetMaxSortOrder(pdf.ID)
+	sortOrder := maxOrder
+	count := 0
+
+	// 逐个处理：分类 -> 插入 -> 获取真实ID -> 加入列表供后续查找
+	for _, item := range input {
+		if item.Title == "" {
+			continue
+		}
+		if item.Page < 0 || item.Page > pdf.PageCount {
+			item.Page = 0
+		}
+
+		displayTitle, parentID, level := classifyTitle(item.Title, allMarks)
+		sortOrder += 1
+
+		id, err := s.db.AddMark(pdf.ID, item.Page, displayTitle, parentID, level, sortOrder)
+		if err != nil {
+			log.Printf("batch add mark failed: %v", err)
+			continue
+		}
+
+		allMarks = append(allMarks, &models.PageMark{
+			ID:      id,
+			PageNum: item.Page,
+			Title:   displayTitle,
+			Level:   level,
+		})
+		count++
+	}
+
+	if count == 0 {
+		writeError(w, 400, "no valid items added")
+		return
+	}
+	log.Printf("batch added %d marks for PDF %d", count, pdf.ID)
+	writeJSON(w, 200, map[string]interface{}{"status": "added", "count": count})
 }
 
 func (s *Server) handleExtractOutline(w http.ResponseWriter, r *http.Request) {

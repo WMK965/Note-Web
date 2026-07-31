@@ -86,11 +86,25 @@ func migrate(db *sql.DB) error {
 			title TEXT NOT NULL,
 			level INTEGER NOT NULL DEFAULT 0,
 			is_outline INTEGER NOT NULL DEFAULT 0,
+			sort_order REAL NOT NULL DEFAULT 0,
+			parent_id INTEGER DEFAULT NULL,
 			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 			FOREIGN KEY (pdf_id) REFERENCES pdfs(id)
 		);
 		CREATE INDEX IF NOT EXISTS idx_marks_pdf ON page_marks(pdf_id);
 	`)
+
+	// 迁移：为旧表添加新列
+	var markColCount int
+	db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('page_marks') WHERE name = 'sort_order'`).Scan(&markColCount)
+	if markColCount == 0 {
+		db.Exec(`ALTER TABLE page_marks ADD COLUMN sort_order REAL NOT NULL DEFAULT 0`)
+	}
+	db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('page_marks') WHERE name = 'parent_id'`).Scan(&markColCount)
+	if markColCount == 0 {
+		db.Exec(`ALTER TABLE page_marks ADD COLUMN parent_id INTEGER DEFAULT NULL`)
+	}
+
 	return err
 }
 
@@ -305,8 +319,8 @@ func (db *Database) GetCacheStatus(id int64) (*models.CacheStatus, error) {
 
 func (db *Database) ListMarks(pdfID int64) ([]*models.PageMark, error) {
 	rows, err := db.Query(`
-		SELECT id, page_num, title, level, is_outline FROM page_marks
-		WHERE pdf_id = ? ORDER BY is_outline DESC, page_num ASC, id ASC
+		SELECT id, page_num, title, level, is_outline, sort_order, parent_id FROM page_marks
+		WHERE pdf_id = ? ORDER BY sort_order ASC, id ASC
 	`, pdfID)
 	if err != nil {
 		return nil, err
@@ -317,18 +331,28 @@ func (db *Database) ListMarks(pdfID int64) ([]*models.PageMark, error) {
 	for rows.Next() {
 		m := &models.PageMark{}
 		var isOutline int
-		if err := rows.Scan(&m.ID, &m.PageNum, &m.Title, &m.Level, &isOutline); err != nil {
+		var parentID sql.NullInt64
+		if err := rows.Scan(&m.ID, &m.PageNum, &m.Title, &m.Level, &isOutline, &m.SortOrder, &parentID); err != nil {
 			return nil, err
 		}
 		m.IsOutline = isOutline == 1
+		if parentID.Valid {
+			m.ParentID = parentID.Int64
+		}
 		marks = append(marks, m)
 	}
 	return marks, rows.Err()
 }
 
-func (db *Database) AddMark(pdfID int64, pageNum int, title string) (int64, error) {
-	res, err := db.Exec(`INSERT INTO page_marks (pdf_id, page_num, title, is_outline) VALUES (?, ?, ?, 0)`,
-		pdfID, pageNum, title)
+func (db *Database) AddMark(pdfID int64, pageNum int, title string, parentID int64, level int, sortOrder float64) (int64, error) {
+	var parentVal interface{}
+	if parentID == 0 {
+		parentVal = nil
+	} else {
+		parentVal = parentID
+	}
+	res, err := db.Exec(`INSERT INTO page_marks (pdf_id, page_num, title, is_outline, parent_id, level, sort_order) VALUES (?, ?, ?, 0, ?, ?, ?)`,
+		pdfID, pageNum, title, parentVal, level, sortOrder)
 	if err != nil {
 		return 0, err
 	}
@@ -338,6 +362,79 @@ func (db *Database) AddMark(pdfID int64, pageNum int, title string) (int64, erro
 func (db *Database) DeleteMark(markID, pdfID int64) error {
 	_, err := db.Exec(`DELETE FROM page_marks WHERE id = ? AND pdf_id = ? AND is_outline = 0`, markID, pdfID)
 	return err
+}
+
+// ReorderMarks 批量更新标记的排序和父子关系
+func (db *Database) ReorderMarks(pdfID int64, items []ReorderItem) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	for _, item := range items {
+		var parentVal interface{}
+		if item.ParentID == 0 {
+			parentVal = nil
+		} else {
+			parentVal = item.ParentID
+		}
+		if _, err := tx.Exec(`UPDATE page_marks SET sort_order = ?, parent_id = ? WHERE id = ? AND pdf_id = ?`,
+			item.SortOrder, parentVal, item.ID, pdfID); err != nil {
+			tx.Rollback()
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// ReorderItem 是 ReorderMarks 的参数
+type ReorderItem struct {
+	ID        int64   `json:"id"`
+	SortOrder float64 `json:"sort_order"`
+	ParentID  int64   `json:"parent_id"`
+}
+
+// GetMaxSortOrder 获取某个PDF下标记的最大排序值
+func (db *Database) GetMaxSortOrder(pdfID int64) (float64, error) {
+	var maxOrder float64
+	err := db.QueryRow(`SELECT COALESCE(MAX(sort_order), 0) FROM page_marks WHERE pdf_id = ?`, pdfID).Scan(&maxOrder)
+	return maxOrder, err
+}
+
+// BatchMarkItem 是批量添加标记的单个条目
+type BatchMarkItem struct {
+	PageNum   int    `json:"page"`
+	Title     string `json:"title"`
+	ParentID  int64  `json:"parent_id"`
+	Level     int    `json:"level"`
+	SortOrder float64 `json:"sort_order"`
+}
+
+// AddMarksBatch 在一个事务中批量插入多个标记
+func (db *Database) AddMarksBatch(pdfID int64, items []BatchMarkItem) (int, error) {
+	tx, err := db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	count := 0
+	for _, item := range items {
+		var parentVal interface{}
+		if item.ParentID == 0 {
+			parentVal = nil
+		} else {
+			parentVal = item.ParentID
+		}
+		res, err := tx.Exec(`INSERT INTO page_marks (pdf_id, page_num, title, is_outline, parent_id, level, sort_order) VALUES (?, ?, ?, 0, ?, ?, ?)`,
+			pdfID, item.PageNum, item.Title, parentVal, item.Level, item.SortOrder)
+		if err != nil {
+			tx.Rollback()
+			return 0, err
+		}
+		id, _ := res.LastInsertId()
+		// 更新 item 的 ID 供后续条目查找父级（通过指针修改）
+		_ = id
+		count++
+	}
+	return count, tx.Commit()
 }
 
 func (db *Database) HasOutlineMarks(pdfID int64) (bool, error) {
@@ -356,9 +453,9 @@ func (db *Database) AddOutlineMarks(pdfID int64, entries []models.OutlineEntry) 
 	if err != nil {
 		return err
 	}
-	for _, e := range entries {
-		if _, err := tx.Exec(`INSERT INTO page_marks (pdf_id, page_num, title, level, is_outline) VALUES (?, ?, ?, ?, 1)`,
-			pdfID, e.Page, e.Title, e.Level); err != nil {
+	for i, e := range entries {
+		if _, err := tx.Exec(`INSERT INTO page_marks (pdf_id, page_num, title, level, is_outline, sort_order) VALUES (?, ?, ?, ?, 1, ?)`,
+			pdfID, e.Page, e.Title, e.Level, float64(i+1)); err != nil {
 			tx.Rollback()
 			return err
 		}

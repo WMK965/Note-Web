@@ -35,11 +35,13 @@ type CacheStatus struct {
 
 // PageMark 表示一个页面标记（可以是PDF自带目录项或用户自定义标记）
 type PageMark struct {
-	ID        int64  `json:"id"`         // 标记ID
-	PageNum   int    `json:"page_num"`   // 页码
-	Title     string `json:"title"`      // 标记标题
-	IsOutline bool   `json:"is_outline"` // 是否来自PDF自带目录
-	Level     int    `json:"level"`      // 目录层级（0为顶级）
+	ID        int64   `json:"id"`          // 标记ID
+	PageNum   int     `json:"page_num"`    // 页码（0表示纯标题/分隔符）
+	Title     string  `json:"title"`       // 标记标题
+	IsOutline bool    `json:"is_outline"`  // 是否来自PDF自带目录
+	Level     int     `json:"level"`       // 目录层级（0为顶级）
+	SortOrder float64 `json:"sort_order"`  // 排序值（支持小数，用于拖拽排序）
+	ParentID  int64   `json:"parent_id"`   // 父标记ID（0表示无父级）
 }
 
 // OutlineEntry 表示PDF目录的一个条目（从 mutool 提取）

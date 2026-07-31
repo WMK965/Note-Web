@@ -670,10 +670,21 @@ $('tap-left').addEventListener('click', () => { if (zoom === 1) goPrev(); });
 $('tap-right').addEventListener('click', () => { if (zoom === 1) goNext(); });
 
 // 键盘导航（桌面端）
+// 注意：不处理空格键（避免与输入框空格冲突），在输入框中不触发翻页
 document.addEventListener('keydown', e => {
+    if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+    if (e.isComposing) return; // IME 组字中不处理快捷键
     if ($('reader').classList.contains('hidden')) return;
+
     if (e.key === 'ArrowLeft') goPrev();
-    if (e.key === 'ArrowRight' || e.key === ' ') { e.preventDefault(); goNext(); }
+    if (e.key === 'ArrowRight') goNext();
+
+    // 按 \ 键打开/关闭目录侧边栏
+    if (e.code === 'Backslash') {
+        e.preventDefault();
+        if ($('marks-sidebar').classList.contains('open')) closeMarksSidebar();
+        else openMarksSidebar();
+    }
 });
 
 // ===== 滑动手势（仅在未缩放时生效）=====
@@ -730,6 +741,7 @@ function applyTransform() {
     // transform-origin: 0 0（在 CSS 中设置），所以变换从图片左上角开始
     // 顺序：先平移再缩放 -> translate(panX, panY) scale(zoom)
     $('page-base').style.transform = `translate(${panX}px, ${panY}px) scale(${zoom})`;
+    $('page-area').style.cursor = zoom > 1 ? (mousePanning ? 'grabbing' : 'grab') : '';
 }
 
 /** 重置缩放和平移到初始状态（zoom=1, pan=0） */
@@ -738,6 +750,7 @@ function resetZoom() {
     $('page-base').style.transform = '';
     $('page-base').classList.remove('smooth');
     $('page-overlay').style.transform = '';
+    $('page-area').style.cursor = '';
 }
 
 /**
@@ -833,19 +846,69 @@ $('page-area').addEventListener('touchend', e => {
     if (e.touches.length < 2) pinchStartDist = 0;
 }, { passive: true });
 
-// ===== 横向滚轮缩放 =====
-// 横向滚轮向右 -> 放大，向左 -> 缩小，以鼠标位置为焦点
+// ===== 滚轮事件：横向缩放 + 竖向翻页 + Ctrl缩放 =====
+let lastScrollPage = 0; // 竖向滚轮翻页节流时间戳
+
 $('page-area').addEventListener('wheel', e => {
-    if (e.deltaX === 0) return; // 只处理横向滚轮
-    e.preventDefault();
-    const focal = getFocalPoint(e.clientX, e.clientY);
-    const factor = e.deltaX > 0 ? 1.15 : 0.87; // 右滚放大15%，左滚缩小13%
-    smoothZoomAt(focal.x, focal.y, zoom * factor);
+    if (e.deltaX !== 0) {
+        // 横向滚轮 -> 缩放（灵敏度降至原来的1/3：1.05/0.95 替代 1.15/0.87）
+        e.preventDefault();
+        const focal = getFocalPoint(e.clientX, e.clientY);
+        const factor = e.deltaX > 0 ? 1.05 : 0.95;
+        smoothZoomAt(focal.x, focal.y, zoom * factor);
+    } else if (e.deltaY !== 0) {
+        if (e.ctrlKey) {
+            // Ctrl + 竖向滚轮 -> 缩放
+            e.preventDefault();
+            const focal = getFocalPoint(e.clientX, e.clientY);
+            const factor = e.deltaY > 0 ? 0.95 : 1.05;
+            smoothZoomAt(focal.x, focal.y, zoom * factor);
+        } else if (zoom === 1) {
+            // 竖向滚轮 -> 翻页（300ms节流，防止滚轮连续触发）
+            e.preventDefault();
+            const now = Date.now();
+            if (now - lastScrollPage < 300) return;
+            lastScrollPage = now;
+            if (e.deltaY > 0) goNext();
+            else goPrev();
+        }
+    }
 }, { passive: false });
+
+// ===== 鼠标拖拽平移（缩放状态下）=====
+// 桌面端：zoom > 1 时按住左键拖拽平移图片
+let mousePanning = false;
+$('page-area').addEventListener('mousedown', e => {
+    if (e.button !== 0) return;             // 只处理左键
+    if (zoom <= 1) return;                  // 仅缩放状态下平移
+    if (e.target.closest('.tap-zone') || e.target.closest('button')) return; // 不干扰按钮和点击区
+    e.preventDefault();
+    mousePanning = true;
+    panStartX = e.clientX;
+    panStartY = e.clientY;
+    panOrigX = panX;
+    panOrigY = panY;
+    $('page-area').style.cursor = 'grabbing';
+});
+document.addEventListener('mousemove', e => {
+    if (!mousePanning) return;
+    panX = panOrigX + (e.clientX - panStartX);
+    panY = panOrigY + (e.clientY - panStartY);
+    applyTransform();
+});
+document.addEventListener('mouseup', () => {
+    if (mousePanning) {
+        mousePanning = false;
+        $('page-area').style.cursor = '';
+    }
+});
 
 // ===== 目录与标记侧边栏 =====
 
-/** 打开侧边栏：移除 hidden 类，下一帧添加 open 类触发滑入动画 */
+let collapsedMarks = new Set(); // 已折叠的标记ID集合
+let currentMarks = [];          // 当前标记列表（从后端加载）
+
+/** 打开侧边栏 */
 function openMarksSidebar() {
     $('marks-sidebar').classList.remove('hidden');
     $('marks-backdrop').classList.remove('hidden');
@@ -856,7 +919,7 @@ function openMarksSidebar() {
     loadMarks();
 }
 
-/** 关闭侧边栏：移除 open 类触发滑出动画，200ms 后添加 hidden 类 */
+/** 关闭侧边栏 */
 function closeMarksSidebar() {
     $('marks-sidebar').classList.remove('open');
     $('marks-backdrop').classList.remove('open');
@@ -866,76 +929,238 @@ function closeMarksSidebar() {
     }, 200);
 }
 
-/** 从后端加载当前 PDF 的目录和标记列表 */
+/** 从后端加载标记列表 */
 async function loadMarks() {
     const list = $('marks-list');
     list.innerHTML = '<div class="marks-empty">加载中...</div>';
     try {
-        const marks = await apiJSON(`/api/pdfs/${currentPDFKey}/marks`);
-        renderMarks(marks || []);
+        currentMarks = await apiJSON(`/api/pdfs/${currentPDFKey}/marks`);
+        renderMarks(currentMarks || []);
     } catch (e) {
         list.innerHTML = '<div class="marks-empty">加载失败</div>';
     }
 }
 
 /**
- * 渲染标记列表
- * 分两部分：PDF目录（is_outline=true，只读）和我的标记（is_outline=false，可删除）
- * 点击任意标记 -> 关闭侧边栏并跳转到对应页面
+ * 渲染标记列表为树形结构
+ * 根据 parent_id 构建父子关系，按 sort_order 排序
+ * 有子项的标记显示展开/折叠箭头，点击箭头切换折叠状态
+ * 用户标记可拖拽排序和删除，PDF目录只读
  */
 function renderMarks(marks) {
+    currentMarks = marks;
     const list = $('marks-list');
     if (marks.length === 0) {
-        list.innerHTML = '<div class="marks-empty">暂无目录或标记<br>可在下方添加自定义标记</div>';
+        list.innerHTML = '<div class="marks-empty">暂无目录或标记<br>可在下方添加</div>';
         return;
     }
-    const outline = marks.filter(m => m.is_outline);
-    const userMarks = marks.filter(m => !m.is_outline);
+
+    // 构建 parent_id -> children 映射
+    const childrenMap = new Map();
+    const roots = [];
+    for (const m of marks) {
+        if (m.parent_id) {
+            if (!childrenMap.has(m.parent_id)) childrenMap.set(m.parent_id, []);
+            childrenMap.get(m.parent_id).push(m);
+        } else {
+            roots.push(m);
+        }
+    }
+
+    // 递归渲染树节点
     let html = '';
-    // PDF目录部分（按层级缩进显示）
-    if (outline.length > 0) {
-        html += '<div class="marks-section">PDF目录</div>';
-        for (const m of outline) {
-            const indent = m.level * 16; // 每级缩进 16px
-            html += `<div class="mark-item" data-page="${m.page_num}" style="padding-left:${8 + indent}px">
-                <span class="mark-title">${escapeHtml(m.title)}</span><span class="mark-page">${m.page_num}</span></div>`;
+    function renderNode(m, level) {
+        const children = childrenMap.get(m.id) || [];
+        const hasChildren = children.length > 0;
+        const isCollapsed = collapsedMarks.has(m.id);
+        const indent = level * 20;
+        const isSection = m.page_num === 0;
+
+        html += `<div class="mark-item ${isSection ? 'section' : ''}" data-id="${m.id}" data-page="${m.page_num}" data-level="${level}" data-parent="${m.parent_id || 0}" style="padding-left:${8 + indent}px">`;
+
+        // 展开/折叠箭头
+        html += `<span class="mark-toggle ${hasChildren ? '' : 'no-children'} ${isCollapsed ? 'collapsed' : ''}" data-toggle="${m.id}">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 9l6 6 6-6"/></svg>
+        </span>`;
+
+        // 拖拽手柄（仅用户标记）
+        if (!m.is_outline) {
+            html += `<span class="mark-drag" data-drag="${m.id}">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="9" cy="6" r="1"/><circle cx="15" cy="6" r="1"/><circle cx="9" cy="12" r="1"/><circle cx="15" cy="12" r="1"/><circle cx="9" cy="18" r="1"/><circle cx="15" cy="18" r="1"/></svg>
+            </span>`;
+        }
+
+        html += `<span class="mark-title ${isSection ? 'section' : ''}">${escapeHtml(m.title)}</span>`;
+        if (m.page_num > 0) html += `<span class="mark-page">${m.page_num}</span>`;
+        if (!m.is_outline) {
+            html += `<button class="mark-delete" data-id="${m.id}" aria-label="删除"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg></button>`;
+        }
+        html += '</div>';
+
+        // 递归渲染子项（折叠时跳过）
+        if (hasChildren && !isCollapsed) {
+            for (const child of children) renderNode(child, level + 1);
         }
     }
-    // 用户自定义标记部分（可删除）
-    if (userMarks.length > 0) {
-        html += '<div class="marks-section">我的标记</div>';
-        for (const m of userMarks) {
-            html += `<div class="mark-item" data-page="${m.page_num}" data-id="${m.id}">
-                <span class="mark-title">${escapeHtml(m.title)}</span><span class="mark-page">${m.page_num}</span>
-                <button class="mark-delete" data-id="${m.id}" aria-label="删除">
-                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg>
-                </button></div>`;
-        }
-    }
+    for (const m of roots) renderNode(m, 0);
+
     list.innerHTML = html;
-    // 绑定点击事件：跳转到对应页面
+    bindMarkEvents(list);
+}
+
+/** 为标记列表绑定事件：点击跳转、展开折叠、删除、拖拽 */
+function bindMarkEvents(list) {
+    // 点击标记项 -> 跳转到对应页面
     list.querySelectorAll('.mark-item').forEach(el => {
         el.addEventListener('click', e => {
-            if (e.target.closest('.mark-delete')) return; // 点击的是删除按钮
+            if (e.target.closest('.mark-toggle') || e.target.closest('.mark-delete') || e.target.closest('.mark-drag')) return;
             const page = parseInt(el.dataset.page);
-            closeMarksSidebar();
-            setTimeout(() => loadPage(page, 'fade'), 100); // 等侧边栏开始关闭后再翻页
+            if (page > 0) {
+                closeMarksSidebar();
+                setTimeout(() => loadPage(page, 'fade'), 100);
+            }
         });
     });
-    // 绑定删除按钮事件
+
+    // 展开/折叠箭头
+    list.querySelectorAll('.mark-toggle[data-toggle]').forEach(el => {
+        el.addEventListener('click', e => {
+            e.stopPropagation();
+            const id = parseInt(el.dataset.toggle);
+            if (collapsedMarks.has(id)) {
+                collapsedMarks.delete(id);
+            } else {
+                collapsedMarks.add(id);
+            }
+            renderMarks(currentMarks); // 重新渲染
+        });
+    });
+
+    // 删除按钮
     list.querySelectorAll('.mark-delete').forEach(btn => {
         btn.addEventListener('click', e => {
             e.stopPropagation();
             deleteMark(parseInt(btn.dataset.id));
         });
     });
+
+    // 拖拽手柄（Pointer Events，同时支持鼠标和触摸）
+    list.querySelectorAll('.mark-drag[data-drag]').forEach(el => {
+        el.addEventListener('pointerdown', e => startMarkDrag(e, parseInt(el.dataset.drag)));
+    });
+}
+
+// ===== 拖拽排序（Pointer Events）=====
+let dragData = null;
+
+function startMarkDrag(e, markId) {
+    e.preventDefault();
+    e.stopPropagation();
+    const list = $('marks-list');
+    const allItems = [...list.querySelectorAll('.mark-item')];
+    const item = allItems.find(el => parseInt(el.dataset.id) === markId);
+    if (!item) return;
+
+    const itemLevel = parseInt(item.dataset.level);
+    // 找到所有子项（DOM中紧随其后的层级更高的项）
+    const itemIndex = allItems.indexOf(item);
+    const children = [];
+    for (let i = itemIndex + 1; i < allItems.length; i++) {
+        if (parseInt(allItems[i].dataset.level) <= itemLevel) break;
+        children.push(allItems[i]);
+    }
+
+    dragData = { id: markId, element: item, children, startY: e.clientY, moved: false };
+    item.setPointerCapture(e.pointerId);
+    item.classList.add('dragging');
+    children.forEach(c => c.classList.add('dragging'));
+
+    item.addEventListener('pointermove', onMarkDragMove);
+    item.addEventListener('pointerup', onMarkDragEnd);
+}
+
+function onMarkDragMove(e) {
+    if (!dragData) return;
+    e.preventDefault();
+    if (Math.abs(e.clientY - dragData.startY) < 5) return;
+    dragData.moved = true;
+
+    // 找到指针下方的标记项
+    const elements = document.elementsFromPoint(e.clientX, e.clientY);
+    const target = elements.find(el => el.classList && el.classList.contains('mark-item') && !el.classList.contains('dragging'));
+
+    // 清除之前的拖放指示
+    $('marks-list').querySelectorAll('.drag-over').forEach(el => el.classList.remove('drag-over'));
+    if (target) target.classList.add('drag-over');
+}
+
+function onMarkDragEnd(e) {
+    if (!dragData) return;
+    e.preventDefault();
+    const list = $('marks-list');
+
+    if (dragData.moved) {
+        const elements = document.elementsFromPoint(e.clientX, e.clientY);
+        const target = elements.find(el => el.classList && el.classList.contains('mark-item') && !el.classList.contains('dragging'));
+
+        if (target && target !== dragData.element) {
+            const rect = target.getBoundingClientRect();
+            const insertBefore = e.clientY < rect.top + rect.height / 2;
+
+            // 移动拖拽项及其子项到目标位置
+            const itemsToMove = [dragData.element, ...dragData.children];
+            if (insertBefore) {
+                list.insertBefore(dragData.element, target);
+            } else {
+                target.after(dragData.element);
+            }
+            let prev = dragData.element;
+            for (const child of dragData.children) {
+                prev.after(child);
+                prev = child;
+            }
+            // 更新层级（如果放在不同缩进的位置，保持原层级不变）
+            saveMarkOrder();
+        }
+    }
+
+    // 清理
+    dragData.element.classList.remove('dragging');
+    dragData.children.forEach(c => c.classList.remove('dragging'));
+    list.querySelectorAll('.drag-over').forEach(el => el.classList.remove('drag-over'));
+    dragData.element.removeEventListener('pointermove', onMarkDragMove);
+    dragData.element.removeEventListener('pointerup', onMarkDragEnd);
+
+    // 如果发生了拖拽移动，阻止后续的 click 事件（防止误触发页面跳转）
+    if (dragData.moved) {
+        const suppress = ev => { ev.preventDefault(); ev.stopPropagation(); };
+        dragData.element.addEventListener('click', suppress, { capture: true, once: true });
+        dragData.children.forEach(c => c.addEventListener('click', suppress, { capture: true, once: true }));
+    }
+
+    dragData = null;
+}
+
+/** 收集当前DOM顺序，发送排序更新到后端 */
+function saveMarkOrder() {
+    const items = [...$('marks-list').querySelectorAll('.mark-item')];
+    const order = items.map((el, i) => ({
+        id: parseInt(el.dataset.id),
+        sort_order: i + 1,
+        parent_id: parseInt(el.dataset.parent) || 0
+    }));
+    api(`/api/pdfs/${currentPDFKey}/marks/reorder`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(order)
+    }).catch(() => showToast('排序保存失败'));
 }
 
 /** 删除一个用户自定义标记 */
 async function deleteMark(id) {
     try {
         await api(`/api/pdfs/${currentPDFKey}/marks/${id}`, { method: 'DELETE' });
-        loadMarks(); // 刷新列表
+        loadMarks();
         showToast('已删除');
     } catch (e) { showToast('删除失败'); }
 }
@@ -945,7 +1170,7 @@ $('marks-btn').addEventListener('click', openMarksSidebar);
 $('marks-close').addEventListener('click', closeMarksSidebar);
 $('marks-backdrop').addEventListener('click', closeMarksSidebar);
 
-// 添加标记按钮
+// 添加标记按钮（后端自动根据标题编号归类）
 $('mark-add-btn').addEventListener('click', () => {
     const input = $('mark-title-input');
     const title = input.value.trim();
@@ -957,12 +1182,73 @@ $('mark-add-btn').addEventListener('click', () => {
     }).then(() => {
         input.value = '';
         loadMarks();
-        showToast('已添加标记');
+        showToast('已添加');
     }).catch(() => showToast('添加失败'));
 });
-// 输入框按 Enter 也触发添加
 $('mark-title-input').addEventListener('keydown', e => {
     if (e.key === 'Enter') $('mark-add-btn').click();
+});
+
+// ===== 批量添加目录 =====
+
+// 打开批量添加模态窗口
+$('batch-add-btn').addEventListener('click', () => {
+    $('batch-modal').classList.remove('hidden');
+    $('batch-input').focus();
+});
+
+// 关闭模态窗口
+function closeBatchModal() {
+    $('batch-modal').classList.add('hidden');
+    $('batch-input').value = '';
+}
+$('batch-close').addEventListener('click', closeBatchModal);
+$('batch-cancel').addEventListener('click', closeBatchModal);
+
+// 确认批量添加：解析文本，发送到后端
+$('batch-confirm').addEventListener('click', async () => {
+    const text = $('batch-input').value.trim();
+    if (!text) return;
+
+    // 解析每行：格式 "标题 -- 页码"，无 "--" 的行视为纯标题（page=0）
+    const items = [];
+    for (const line of text.split('\n')) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        const sepIdx = trimmed.lastIndexOf(' -- ');
+        if (sepIdx > 0) {
+            const title = trimmed.slice(0, sepIdx).trim();
+            const pageStr = trimmed.slice(sepIdx + 4).trim();
+            const page = parseInt(pageStr) || 0;
+            if (title) items.push({ title, page });
+        } else {
+            items.push({ title: trimmed, page: 0 });
+        }
+    }
+
+    if (items.length === 0) {
+        showToast('未解析到有效条目');
+        return;
+    }
+
+    try {
+        const res = await api(`/api/pdfs/${currentPDFKey}/marks/batch`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(items)
+        });
+        const data = await res.json();
+        closeBatchModal();
+        loadMarks();
+        showToast(`已添加 ${data.count} 个目录项`);
+    } catch (e) {
+        showToast('批量添加失败');
+    }
+});
+
+// 按 Esc 关闭模态窗口
+$('batch-input').addEventListener('keydown', e => {
+    if (e.key === 'Escape') closeBatchModal();
 });
 
 // ===== 初始化 =====
