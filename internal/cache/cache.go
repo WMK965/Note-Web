@@ -387,10 +387,22 @@ func (m *Manager) StartEviction() {
 	}()
 }
 
-// evict 执行一轮LRU淘汰
-// 查询被动缓存中最后访问时间最早的PDF，删除其缓存文件，直到总大小低于限制
+// evict 执行一轮LRU淘汰与软删除清理
+// M9: 先清理已删除PDF的缓存文件和标记，再检查缓存大小
 func (m *Manager) evict() {
-	size, err := m.db.GetPassiveCacheSize()
+	// 清理已删除PDF的缓存（M9）
+	ids := m.db.CleanupDeletedPDFs()
+	for _, id := range ids {
+		// 获取cache_key来删除缓存目录
+		pdf, err := m.db.GetPDF(id)
+		if err != nil {
+			continue
+		}
+		dir := m.pdfDir(pdf.CacheKey)
+		os.RemoveAll(dir)
+	}
+
+	size, err := m.db.GetTotalCacheSize()
 	if err != nil {
 		log.Printf("eviction: failed to get cache size: %v", err)
 		return

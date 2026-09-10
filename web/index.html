@@ -13,7 +13,17 @@
 
 <div id="library" class="view">
     <header class="lib-header">
-        <div id="breadcrumb" class="breadcrumb"></div>
+        <div class="lib-top">
+            <div id="breadcrumb" class="breadcrumb"></div>
+            <span id="cache-stats" class="cache-stats">
+                <svg width="24" height="24" viewBox="0 0 24 24">
+                    <circle cx="12" cy="12" r="10" fill="none" stroke="var(--border)" stroke-width="3"/>
+                    <circle id="cache-ring" cx="12" cy="12" r="10" fill="none" stroke="var(--accent)" stroke-width="3"
+                        stroke-linecap="round" stroke-dasharray="62.832" stroke-dashoffset="62.832" transform="rotate(-90,12,12)"/>
+                </svg>
+                <span class="cache-tooltip" id="cache-tooltip"></span>
+            </span>
+        </div>
         <input type="search" id="search" placeholder="搜索..." autocomplete="off">
     </header>
     <div id="pdf-list" class="pdf-list"></div>

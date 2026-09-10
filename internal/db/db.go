@@ -10,6 +10,7 @@ package db
 
 import (
 	"database/sql"
+	"log"
 	"time"
 
 	"note-web/internal/models"
@@ -24,7 +25,7 @@ type Database struct {
 }
 
 func Init(path string) (*Database, error) {
-	db, err := sql.Open("sqlite", path+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)")
+	db, err := sql.Open("sqlite", path+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(on)")
 	if err != nil {
 		return nil, err
 	}
@@ -66,12 +67,16 @@ func migrate(db *sql.DB) error {
 	var colCount int
 	db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('pdfs') WHERE name = 'cache_key'`).Scan(&colCount)
 	if colCount == 0 {
-		db.Exec(`ALTER TABLE pdfs ADD COLUMN cache_key TEXT NOT NULL DEFAULT ''`)
+		if _, err := db.Exec(`ALTER TABLE pdfs ADD COLUMN cache_key TEXT NOT NULL DEFAULT ''`); err != nil {
+			log.Printf("migration: failed to add cache_key column: %v", err)
+		}
 	}
 
 	db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('pdfs') WHERE name = 'rebuilding'`).Scan(&colCount)
 	if colCount == 0 {
-		db.Exec(`ALTER TABLE pdfs ADD COLUMN rebuilding INTEGER NOT NULL DEFAULT 0`)
+		if _, err := db.Exec(`ALTER TABLE pdfs ADD COLUMN rebuilding INTEGER NOT NULL DEFAULT 0`); err != nil {
+			log.Printf("migration: failed to add rebuilding column: %v", err)
+		}
 	}
 
 	_, err = db.Exec(`
@@ -98,11 +103,15 @@ func migrate(db *sql.DB) error {
 	var markColCount int
 	db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('page_marks') WHERE name = 'sort_order'`).Scan(&markColCount)
 	if markColCount == 0 {
-		db.Exec(`ALTER TABLE page_marks ADD COLUMN sort_order REAL NOT NULL DEFAULT 0`)
+		if _, err := db.Exec(`ALTER TABLE page_marks ADD COLUMN sort_order REAL NOT NULL DEFAULT 0`); err != nil {
+			log.Printf("migration: failed to add sort_order column: %v", err)
+		}
 	}
 	db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('page_marks') WHERE name = 'parent_id'`).Scan(&markColCount)
 	if markColCount == 0 {
-		db.Exec(`ALTER TABLE page_marks ADD COLUMN parent_id INTEGER DEFAULT NULL`)
+		if _, err := db.Exec(`ALTER TABLE page_marks ADD COLUMN parent_id INTEGER DEFAULT NULL`); err != nil {
+			log.Printf("migration: failed to add parent_id column: %v", err)
+		}
 	}
 
 	return err
@@ -273,14 +282,14 @@ func (db *Database) TouchCacheAccess(id int64) error {
 	return err
 }
 
-func (db *Database) GetPassiveCacheSize() (int64, error) {
+func (db *Database) GetTotalCacheSize() (int64, error) {
 	var size int64
-	err := db.QueryRow(`SELECT COALESCE(SUM(cache_size), 0) FROM pdfs WHERE cache_active = 0 AND cached_pages > 0 AND deleted = 0`).Scan(&size)
+	err := db.QueryRow(`SELECT COALESCE(SUM(cache_size), 0) FROM pdfs WHERE cached_pages > 0 AND deleted = 0`).Scan(&size)
 	return size, err
 }
 
 func (db *Database) GetLRUPDFs(limit int) ([]*models.PDF, error) {
-	rows, err := db.Query(`SELECT `+pdfColumns+` FROM pdfs WHERE cache_active = 0 AND cached_pages > 0 AND deleted = 0 ORDER BY cache_last_access ASC NULLS FIRST LIMIT ?`, limit)
+	rows, err := db.Query(`SELECT `+pdfColumns+` FROM pdfs WHERE cached_pages > 0 AND deleted = 0 ORDER BY cache_last_access ASC NULLS FIRST LIMIT ?`, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -360,6 +369,8 @@ func (db *Database) AddMark(pdfID int64, pageNum int, title string, parentID int
 }
 
 func (db *Database) DeleteMark(markID, pdfID int64) error {
+	// 将子标记的 parent_id 设为 NULL（M10: 防止悬空引用）
+	db.Exec(`UPDATE page_marks SET parent_id = NULL WHERE parent_id = ? AND pdf_id = ?`, markID, pdfID)
 	_, err := db.Exec(`DELETE FROM page_marks WHERE id = ? AND pdf_id = ? AND is_outline = 0`, markID, pdfID)
 	return err
 }
@@ -400,43 +411,27 @@ func (db *Database) GetMaxSortOrder(pdfID int64) (float64, error) {
 	return maxOrder, err
 }
 
-// BatchMarkItem 是批量添加标记的单个条目
-type BatchMarkItem struct {
-	PageNum   int    `json:"page"`
-	Title     string `json:"title"`
-	ParentID  int64  `json:"parent_id"`
-	Level     int    `json:"level"`
-	SortOrder float64 `json:"sort_order"`
-}
-
-// AddMarksBatch 在一个事务中批量插入多个标记
-func (db *Database) AddMarksBatch(pdfID int64, items []BatchMarkItem) (int, error) {
-	tx, err := db.Begin()
+// CleanupDeletedPDFs 清理已删除PDF的缓存目录和标记（M9: 防止磁盘无界增长）
+// 返回被清理的PDF ID列表
+func (db *Database) CleanupDeletedPDFs() []int64 {
+	rows, err := db.Query(`SELECT id FROM pdfs WHERE deleted = 1 AND cached_pages > 0`)
 	if err != nil {
-		return 0, err
+		return nil
 	}
-	count := 0
-	for _, item := range items {
-		var parentVal interface{}
-		if item.ParentID == 0 {
-			parentVal = nil
-		} else {
-			parentVal = item.ParentID
-		}
-		res, err := tx.Exec(`INSERT INTO page_marks (pdf_id, page_num, title, is_outline, parent_id, level, sort_order) VALUES (?, ?, ?, 0, ?, ?, ?)`,
-			pdfID, item.PageNum, item.Title, parentVal, item.Level, item.SortOrder)
-		if err != nil {
-			tx.Rollback()
-			return 0, err
-		}
-		id, _ := res.LastInsertId()
-		// 更新 item 的 ID 供后续条目查找父级（通过指针修改）
-		_ = id
-		count++
+	defer rows.Close()
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		rows.Scan(&id)
+		ids = append(ids, id)
+		// 清除缓存统计和标记
+		db.ClearCacheStats(id)
+		db.Exec(`DELETE FROM page_marks WHERE pdf_id = ?`, id)
 	}
-	return count, tx.Commit()
+	return ids
 }
 
+// HasOutlineMarks 检查是否已提取过PDF目录
 func (db *Database) HasOutlineMarks(pdfID int64) (bool, error) {
 	var count int
 	err := db.QueryRow(`SELECT COUNT(*) FROM page_marks WHERE pdf_id = ? AND is_outline = 1`, pdfID).Scan(&count)

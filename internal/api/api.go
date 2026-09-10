@@ -28,6 +28,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"note-web/internal/cache"
 	"note-web/internal/config"
@@ -72,6 +73,7 @@ func (s *Server) Start() error {
 	mux.HandleFunc("PUT /api/pdfs/{key}/marks/reorder", s.handleReorderMarks)
 	mux.HandleFunc("POST /api/pdfs/{key}/marks/batch", s.handleBatchAddMarks)
 	mux.HandleFunc("POST /api/pdfs/{key}/outline", s.handleExtractOutline)
+	mux.HandleFunc("GET /api/cache/stats", s.handleCacheStats)
 
 	fsys, err := fs.Sub(s.webFS, "web")
 	if err != nil {
@@ -79,10 +81,38 @@ func (s *Server) Start() error {
 	}
 	mux.Handle("/", http.FileServer(http.FS(fsys)))
 
+	// 安全响应头中间件（M2）
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("Referrer-Policy", "no-referrer")
+		mux.ServeHTTP(w, r)
+	})
+
+	// HTTP 服务器超时设置（H1: 防止 Slowloris DoS）
 	addr := fmt.Sprintf("%s:%d", s.cfg.Server.Host, s.cfg.Server.Port)
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
 	log.Printf("server starting on %s", addr)
-	return http.ListenAndServe(addr, mux)
+	return srv.ListenAndServe()
 }
+
+// maxBodySize is the maximum JSON body size (H6: prevents memory exhaustion)
+const maxBodySize = 1 << 20 // 1MB
+
+// limitedBody wraps r.Body with MaxBytesReader and returns the limited reader.
+func limitedBody(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxBodySize)
+}
+
+// maxTitleLen is the maximum title length (L4)
+const maxTitleLen = 200
 
 func writeJSON(w http.ResponseWriter, code int, data interface{}) {
 	w.Header().Set("Content-Type", "application/json")
@@ -95,8 +125,7 @@ func writeError(w http.ResponseWriter, code int, msg string) {
 }
 
 // relativePath 根据配置的PDF根目录，计算文件的相对路径
-// 例如：绝对路径 /documents/1/note.pdf，根目录 /documents
-//      -> 相对路径 "1/note.pdf"（用于前端文件树展示）
+// 不匹配任何根目录时返回 "<unknown>" 防止绝对路径泄漏（M5）
 func (s *Server) relativePath(absPath string) string {
 	for _, dir := range s.cfg.PDF.Dirs {
 		dir = strings.TrimSuffix(dir, "/")
@@ -105,7 +134,7 @@ func (s *Server) relativePath(absPath string) string {
 			return strings.TrimPrefix(rel, "/")
 		}
 	}
-	return absPath
+	return "<unknown>"
 }
 
 type pdfListItem struct {
@@ -192,7 +221,7 @@ func (s *Server) handleGetPage(w http.ResponseWriter, r *http.Request) {
 
 	filePath, err := s.cache.GetPage(pdf.ID, pageNum)
 	if err != nil {
-		writeError(w, 404, err.Error())
+		writeError(w, 404, "page not available") // M13: 不泄漏内部错误
 		return
 	}
 
@@ -218,7 +247,7 @@ func (s *Server) handleGetThumb(w http.ResponseWriter, r *http.Request) {
 
 	filePath, err := s.cache.GetThumbnail(pdf.ID, pageNum)
 	if err != nil {
-		writeError(w, 404, err.Error())
+		writeError(w, 404, "thumbnail not available")
 		return
 	}
 
@@ -331,6 +360,7 @@ func (s *Server) handleAddMark(w http.ResponseWriter, r *http.Request) {
 		Page  int    `json:"page"`
 		Title string `json:"title"`
 	}
+	limitedBody(w, r) // H6
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeError(w, 400, "invalid request body")
 		return
@@ -338,6 +368,9 @@ func (s *Server) handleAddMark(w http.ResponseWriter, r *http.Request) {
 	if body.Title == "" {
 		writeError(w, 400, "title is required")
 		return
+	}
+	if len(body.Title) > maxTitleLen { // L4
+		body.Title = body.Title[:maxTitleLen]
 	}
 	if body.Page < 0 || body.Page > pdf.PageCount {
 		writeError(w, 400, "invalid page")
@@ -440,8 +473,13 @@ func (s *Server) handleReorderMarks(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var items []db.ReorderItem
+	limitedBody(w, r) // H6
 	if err := json.NewDecoder(r.Body).Decode(&items); err != nil {
 		writeError(w, 400, "invalid request body")
+		return
+	}
+	if len(items) > 1000 { // cap array length
+		writeError(w, 400, "too many items")
 		return
 	}
 
@@ -467,12 +505,17 @@ func (s *Server) handleBatchAddMarks(w http.ResponseWriter, r *http.Request) {
 		Title string `json:"title"`
 		Page  int    `json:"page"`
 	}
+	limitedBody(w, r) // H6
 	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
 		writeError(w, 400, "invalid request body")
 		return
 	}
 	if len(input) == 0 {
 		writeError(w, 400, "empty batch")
+		return
+	}
+	if len(input) > 500 { // cap array length
+		writeError(w, 400, "too many items (max 500)")
 		return
 	}
 
@@ -489,6 +532,9 @@ func (s *Server) handleBatchAddMarks(w http.ResponseWriter, r *http.Request) {
 	for _, item := range input {
 		if item.Title == "" {
 			continue
+		}
+		if len(item.Title) > maxTitleLen { // L4
+			item.Title = item.Title[:maxTitleLen]
 		}
 		if item.Page < 0 || item.Page > pdf.PageCount {
 			item.Page = 0
@@ -555,4 +601,19 @@ func (s *Server) extractOutline(pdf *models.PDF) int {
 	}
 	log.Printf("extracted %d outline entries for PDF %d", len(entries), pdf.ID)
 	return len(entries)
+}
+
+// handleCacheStats 返回全局缓存使用统计
+func (s *Server) handleCacheStats(w http.ResponseWriter, r *http.Request) {
+	total, err := s.db.GetTotalCacheSize()
+	if err != nil {
+		writeError(w, 500, "failed to get cache stats")
+		return
+	}
+	maxMB := int64(s.cfg.PassiveCache.MaxSizeMB)
+	writeJSON(w, 200, map[string]interface{}{
+		"total_mb": total / (1024 * 1024),
+		"max_mb":   maxMB,
+		"pct":      float64(total) / float64(maxMB*1024*1024) * 100,
+	})
 }

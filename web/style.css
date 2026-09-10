@@ -38,6 +38,26 @@ html, body {
     border-bottom: 1px solid var(--border);
     flex-shrink: 0;
 }
+.lib-top {
+    display: flex; align-items: center; justify-content: space-between;
+    margin-bottom: 10px;
+}
+.cache-stats {
+    position: relative; display: inline-flex; align-items: center;
+    flex-shrink: 0; cursor: default;
+}
+#cache-ring { transition: stroke-dashoffset 0.5s ease, stroke 0.5s ease; }
+.cache-tooltip {
+    display: none;
+    position: absolute; top: 100%; right: 0;
+    background: var(--surface-active); color: var(--text);
+    padding: 6px 10px; border-radius: 6px;
+    font-size: 12px; white-space: nowrap;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+    z-index: 20; margin-top: 4px;
+    pointer-events: none;
+}
+.cache-stats:hover .cache-tooltip { display: block; }
 .breadcrumb {
     display: flex;
     align-items: center;

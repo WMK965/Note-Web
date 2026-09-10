@@ -107,8 +107,8 @@ func (w *Watcher) checkFiles() {
 
 	// 检查每个 pinned PDF 的文件修改时间
 	for _, pdf := range pdfs {
-		stat, err := os.Stat(pdf.Path)
-		if err != nil {
+		stat, err := os.Lstat(pdf.Path) // H2: Lstat 不跟随符号链接
+		if err != nil || stat.Mode()&os.ModeSymlink != 0 {
 			continue // 文件暂时不可访问，跳过
 		}
 

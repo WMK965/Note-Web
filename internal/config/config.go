@@ -4,7 +4,9 @@
 package config
 
 import (
+	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -132,4 +134,36 @@ func Load(path string) (*Config, error) {
 	}
 
 	return cfg, nil
+}
+
+// Validate 检查配置的合法性（M7: 防止极端值导致 panic 或资源耗尽）
+func (c *Config) Validate() error {
+	if c.Server.Port <= 0 || c.Server.Port > 65535 {
+		return fmt.Errorf("invalid port: %d", c.Server.Port)
+	}
+	if len(c.PDF.Dirs) == 0 {
+		return fmt.Errorf("pdf.dirs must not be empty")
+	}
+	if c.PDF.ScanInterval <= 0 {
+		return fmt.Errorf("pdf.scan_interval must be positive")
+	}
+	if c.Render.JpegQuality < 1 || c.Render.JpegQuality > 100 {
+		return fmt.Errorf("render.jpeg_quality must be 1-100")
+	}
+	if c.Render.ScaleWidth < 100 || c.Render.ScaleWidth > 10000 {
+		return fmt.Errorf("render.scale_width must be 100-10000")
+	}
+	if c.ActiveCache.RenderConcurrency <= 0 || c.ActiveCache.RenderConcurrency > 16 {
+		return fmt.Errorf("active_cache.render_concurrency must be 1-16")
+	}
+	if c.PassiveCache.MaxSizeMB <= 0 {
+		return fmt.Errorf("passive_cache.max_size_mb must be positive")
+	}
+	if c.CacheDir == "" || strings.Contains(c.CacheDir, "..") {
+		return fmt.Errorf("invalid cache_dir")
+	}
+	if c.Database.Path == "" || strings.Contains(c.Database.Path, "..") {
+		return fmt.Errorf("invalid database.path")
+	}
+	return nil
 }

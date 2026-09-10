@@ -55,7 +55,10 @@ func (s *Scanner) Scan() error {
 			if d.IsDir() {
 				return nil
 			}
-			// 只处理 .pdf 文件（不区分大小写）
+			// H2: 拒绝符号链接，防止路径穿越
+			if d.Type()&os.ModeSymlink != 0 {
+				return nil
+			}
 			if !strings.EqualFold(filepath.Ext(path), ".pdf") {
 				return nil
 			}
@@ -125,11 +128,13 @@ func (s *Scanner) processPDF(path string, info os.FileInfo) {
 		s.db.UpdatePDFMetadata(id, pdfInfo.PageCount, info.Size(), mtime)
 	}
 
-	// 日志输出
+	// 日志输出（L5: 清理标题中的换行和ANSI转义序列）
+	safeTitle := strings.ReplaceAll(pdfInfo.Title, "\n", " ")
+	safeTitle = strings.ReplaceAll(safeTitle, "\r", "")
 	if id > 0 && existing == nil {
-		log.Printf("new PDF: %s (%d pages, %.1fMB)", pdfInfo.Title, pdfInfo.PageCount, float64(info.Size())/(1024*1024))
+		log.Printf("new PDF: %s (%d pages, %.1fMB)", safeTitle, pdfInfo.PageCount, float64(info.Size())/(1024*1024))
 	} else if existing != nil && existing.FileMtime != mtime {
-		log.Printf("updated PDF: %s (%d pages)", pdfInfo.Title, pdfInfo.PageCount)
+		log.Printf("updated PDF: %s (%d pages)", safeTitle, pdfInfo.PageCount)
 	}
 }
 

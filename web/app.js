@@ -52,11 +52,16 @@ const ICON_BOOKMARK_FILL = '<svg viewBox="0 0 24 24" fill="currentColor"><path d
 
 // ===== 工具函数 =====
 
-/** 转义 HTML 特殊字符，防止 XSS */
+/** 转义 HTML 特殊字符，防止 XSS（M11: 同时转义引号，防止属性上下文注入） */
 function escapeHtml(s) {
     const div = document.createElement('div');
     div.textContent = s;
     return div.innerHTML;
+}
+
+/** 安全转义 HTML 属性值（不仅转义HTML实体，也转义引号） */
+function escapeAttr(s) {
+    return s.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/'/g, '&#39;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
 /** 将字节数格式化为人类可读的大小（KB/MB） */
@@ -112,7 +117,8 @@ function handleRoute() {
     if (parts[0] === 'read' && parts[1]) {
         showReader(parts[1], parts[2] ? parseInt(parts[2]) : null);
     } else if (parts[0] === 'folder') {
-        showFolder(parts.slice(1).map(decodeURIComponent).join('/'));
+        const folder = parts.slice(1).map(p => { try { return decodeURIComponent(p); } catch (e) { return p; } }).join('/');
+        showFolder(folder);
     } else {
         showFolder('');
     }
@@ -126,7 +132,24 @@ async function loadLibrary() {
     try {
         allPDFs = await apiJSON('/api/pdfs');
         handleRoute();
+        loadCacheStats();
     } catch (e) { showToast('加载失败'); }
+}
+
+/** 加载全局缓存占用统计，显示为右上角圆环图 */
+async function loadCacheStats() {
+    try {
+        const stats = await apiJSON('/api/cache/stats');
+        const pct = Math.min(100, Math.max(0, stats.pct || 0));
+        // 圆周长 2*PI*r = 2*3.1416*10 ≈ 62.832
+        const circumference = 2 * Math.PI * 10;
+        const offset = circumference * (1 - pct / 100);
+        const ring = $('cache-ring');
+        ring.setAttribute('stroke-dashoffset', offset);
+        // 用量 > 90% 红色，> 70% 橙色，否则蓝色
+        ring.setAttribute('stroke', pct > 90 ? 'var(--error)' : pct > 70 ? 'var(--warning)' : 'var(--accent)');
+        $('cache-tooltip').textContent = `${stats.total_mb.toFixed(0)}MB / ${stats.max_mb}MB (${pct.toFixed(0)}%)`;
+    } catch (e) { /* 静默失败 */ }
 }
 
 /** 显示指定文件夹的内容，隐藏阅读器 */
