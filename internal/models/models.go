@@ -6,27 +6,28 @@ import "time"
 
 // PDF 表示数据库中的一个PDF文件记录
 type PDF struct {
-	ID              int64     `json:"id"`                // 数据库自增ID
-	Path            string    `json:"-"`                 // 文件绝对路径（不返回给前端，安全考虑）
-	Title           string    `json:"title"`             // 文档标题（取自PDF元数据或文件名）
-	CacheKey        string    `json:"cache_key"`         // 缓存键（路径哈希，用于URL路由和缓存目录命名）
-	RelativePath    string    `json:"relative_path"`     // 相对于扫描根目录的路径（用于文件树展示）
-	PageCount       int       `json:"page_count"`        // 总页数
-	FileSize        int64     `json:"file_size"`         // 文件大小（字节）
-	FileMtime       int64     `json:"file_mtime"`        // 文件最后修改时间（Unix时间戳）
-	Pinned          bool      `json:"pinned"`            // 是否标记为主动缓存
-	CacheActive     bool      `json:"cache_active"`      // 主动缓存是否已就绪
-	CacheSize       int64     `json:"cache_size"`        // 已缓存页面总大小（字节）
-	CachedPages     int       `json:"cached_pages"`      // 已缓存页面数
-	CacheVersion    int64     `json:"-"`                 // 缓存版本号（每次页面内容变化递增）
-	ChangedPages    string    `json:"-"`                 // 最近一次变化的具体页码（逗号分隔，空表示范围未知）
-	GoodNotesPath   string    `json:"-"`                 // 同目录同名的 GoodNotes 归档路径
-	GoodNotesSize   int64     `json:"-"`                 // GoodNotes 归档大小（用于变化检测）
-	GoodNotesMtime  int64     `json:"-"`                 // GoodNotes 归档修改时间（用于变化检测）
-	CacheLastAccess time.Time `json:"cache_last_access"` // 最后访问时间（用于LRU淘汰）
-	Deleted         bool      `json:"-"`                 // 是否已标记删除（不返回给前端）
-	CreatedAt       time.Time `json:"created_at"`        // 记录创建时间
-	UpdatedAt       time.Time `json:"updated_at"`        // 记录最后更新时间
+	ID              int64      `json:"id"`                // 数据库自增ID
+	Path            string     `json:"-"`                 // 文件绝对路径（不返回给前端，安全考虑）
+	Title           string     `json:"title"`             // 文档标题（取自PDF元数据或文件名）
+	CacheKey        string     `json:"cache_key"`         // 缓存键（路径哈希，用于URL路由和缓存目录命名）
+	RelativePath    string     `json:"relative_path"`     // 相对于扫描根目录的路径（用于文件树展示）
+	PageCount       int        `json:"page_count"`        // 总页数
+	FileSize        int64      `json:"file_size"`         // 文件大小（字节）
+	FileMtime       int64      `json:"file_mtime"`        // 文件最后修改时间（Unix时间戳）
+	Pinned          bool       `json:"pinned"`            // 是否标记为主动缓存
+	CacheActive     bool       `json:"cache_active"`      // 主动缓存是否已就绪
+	CacheSize       int64      `json:"cache_size"`        // 已缓存页面总大小（字节）
+	CachedPages     int        `json:"cached_pages"`      // 已缓存页面数
+	CacheVersion    int64      `json:"-"`                 // 缓存版本号（每次页面内容变化递增）
+	ChangedPages    string     `json:"-"`                 // 最近一次变化的具体页码（逗号分隔，空表示范围未知）
+	GoodNotesPath   string     `json:"-"`                 // 同目录同名的 GoodNotes 归档路径
+	GoodNotesSize   int64      `json:"-"`                 // GoodNotes 归档大小（用于变化检测）
+	GoodNotesMtime  int64      `json:"-"`                 // GoodNotes 归档修改时间（用于变化检测）
+	CacheLastAccess time.Time  `json:"cache_last_access"` // 最后访问时间（用于LRU淘汰）
+	Deleted         bool       `json:"-"`                 // 是否已标记删除（不返回给前端）
+	DeletedAt       *time.Time `json:"-"`                 // 首次被标记删除的时间（用于清理宽限期）
+	CreatedAt       time.Time  `json:"created_at"`        // 记录创建时间
+	UpdatedAt       time.Time  `json:"updated_at"`        // 记录最后更新时间
 }
 
 // CacheStatus 表示某个PDF的缓存状态（用于API响应）

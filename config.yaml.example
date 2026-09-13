@@ -19,6 +19,10 @@ pdf:
   dirs:
     - /documents
   scan_interval: 300
+  # 文件从磁盘消失后，记录与标记仍保留的宽限天数；
+  # 超过该天数的记录会在扫描时被真正删除（含目录/标记与页面缓存）。
+  # 设为 0 表示下一轮扫描立即清理。
+  retention_days: 30
 
 render:
   jpeg_quality: 80
@@ -35,5 +39,8 @@ passive_cache:
 
 database:
   path: /data/note-web.db
+  # 自动执行 VACUUM 的最小间隔，用于回收删除记录后的空闲页。
+  # 需要 Go 的 duration 格式（"168h" = 7 天）；解析失败时回退为 7 天。
+  vacuum_interval: 168h
 
 cache_dir: /data/cache

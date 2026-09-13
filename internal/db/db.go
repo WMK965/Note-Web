@@ -61,6 +61,7 @@ func migrate(db *sql.DB) error {
 			goodnotes_size INTEGER NOT NULL DEFAULT 0,
 			goodnotes_mtime INTEGER NOT NULL DEFAULT 0,
 			deleted INTEGER NOT NULL DEFAULT 0,
+			deleted_at INTEGER,
 			rebuilding INTEGER NOT NULL DEFAULT 0,
 			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 			updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -106,6 +107,7 @@ func migrate(db *sql.DB) error {
 		{name: "goodnotes_path", definition: "TEXT NOT NULL DEFAULT ''"},
 		{name: "goodnotes_size", definition: "INTEGER NOT NULL DEFAULT 0"},
 		{name: "goodnotes_mtime", definition: "INTEGER NOT NULL DEFAULT 0"},
+		{name: "deleted_at", definition: "INTEGER"},
 	} {
 		db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('pdfs') WHERE name = ?`, column.name).Scan(&colCount)
 		if colCount == 0 {
@@ -113,6 +115,13 @@ func migrate(db *sql.DB) error {
 				log.Printf("migration: failed to add %s column: %v", column.name, err)
 			}
 		}
+	}
+
+	// 旧的软删除记录没有时间戳：用 updated_at 回填（表示为 Unix 秒），
+	// 让宽限期从现在开始计算，避免升级后立刻把历史残留全部清掉。
+	if _, err := db.Exec(`UPDATE pdfs SET deleted_at = CAST(strftime('%s', updated_at) AS INTEGER)
+		WHERE deleted = 1 AND deleted_at IS NULL`); err != nil {
+		log.Printf("migration: failed to backfill deleted_at: %v", err)
 	}
 
 	_, err = db.Exec(`
@@ -130,7 +139,7 @@ func migrate(db *sql.DB) error {
 			sort_order REAL NOT NULL DEFAULT 0,
 			parent_id INTEGER DEFAULT NULL,
 			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-			FOREIGN KEY (pdf_id) REFERENCES pdfs(id)
+			FOREIGN KEY (pdf_id) REFERENCES pdfs(id) ON DELETE CASCADE
 		);
 		CREATE INDEX IF NOT EXISTS idx_marks_pdf ON page_marks(pdf_id);
 	`)
@@ -147,6 +156,15 @@ func migrate(db *sql.DB) error {
 	if markColCount == 0 {
 		if _, err := db.Exec(`ALTER TABLE page_marks ADD COLUMN parent_id INTEGER DEFAULT NULL`); err != nil {
 			log.Printf("migration: failed to add parent_id column: %v", err)
+		}
+	}
+
+	// 迁移：给 page_marks 的外键补上 ON DELETE CASCADE。
+	// 这样删除一条 pdfs 记录时，它的目录项与用户标记会被自动清除，
+	// 不需要在两处手工维护，也不会再留下孤儿标记。
+	if !hasCascadeForeignKey(db, "page_marks") {
+		if err := rebuildMarksWithCascade(db); err != nil {
+			log.Printf("migration: failed to add ON DELETE CASCADE to page_marks: %v", err)
 		}
 	}
 
@@ -173,26 +191,98 @@ func migrate(db *sql.DB) error {
 	return err
 }
 
+// hasCascadeForeignKey 判断某张表的外键是否已经带上 ON DELETE CASCADE
+func hasCascadeForeignKey(db *sql.DB, table string) bool {
+	rows, err := db.Query(`SELECT "on_delete" FROM pragma_foreign_key_list(?)`, table)
+	if err != nil {
+		return false
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var onDelete string
+		if err := rows.Scan(&onDelete); err != nil {
+			return false
+		}
+		if strings.EqualFold(onDelete, "CASCADE") {
+			return true
+		}
+	}
+	return false
+}
+
+// rebuildMarksWithCascade 重建 page_marks 表，把外键补成 ON DELETE CASCADE。
+// SQLite 不支持修改外键约束，只能按官方推荐的“建新表 -> 拷数据 -> 换名”流程来做。
+// 拷贝前先清掉历史孤儿行，否则新表的外键校验会失败。
+func rebuildMarksWithCascade(db *sql.DB) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec(`DELETE FROM page_marks WHERE pdf_id NOT IN (SELECT id FROM pdfs)`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`CREATE TABLE page_marks_migrated (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			pdf_id INTEGER NOT NULL,
+			page_num INTEGER NOT NULL,
+			title TEXT NOT NULL,
+			level INTEGER NOT NULL DEFAULT 0,
+			is_outline INTEGER NOT NULL DEFAULT 0,
+			sort_order REAL NOT NULL DEFAULT 0,
+			parent_id INTEGER DEFAULT NULL,
+			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+			FOREIGN KEY (pdf_id) REFERENCES pdfs(id) ON DELETE CASCADE
+		)`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`INSERT INTO page_marks_migrated
+			(id, pdf_id, page_num, title, level, is_outline, sort_order, parent_id, created_at)
+		SELECT id, pdf_id, page_num, title, level, is_outline, sort_order, parent_id, created_at
+		FROM page_marks`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DROP TABLE page_marks`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`ALTER TABLE page_marks_migrated RENAME TO page_marks`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`CREATE INDEX IF NOT EXISTS idx_marks_pdf ON page_marks(pdf_id)`); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	log.Printf("migration: rebuilt page_marks with ON DELETE CASCADE")
+	return nil
+}
+
 // 目录解析逻辑的版本号，变更解析方式时递增即可让旧数据重新提取
 const (
 	keyOutlineParser     = "outline_parser"
 	outlineParserVersion = "4"
+	keyLastVacuum        = "last_vacuum"
 )
 
 const pdfColumns = `id, path, title, cache_key, page_count, file_size, file_mtime,
 		       pinned, cache_active, cache_size, cached_pages, cache_last_access,
 		       deleted, rebuilding, cache_version, changed_pages,
-		       goodnotes_path, goodnotes_size, goodnotes_mtime, created_at, updated_at`
+		       goodnotes_path, goodnotes_size, goodnotes_mtime, created_at, updated_at,
+		       deleted_at`
 
 func scanPDF(r interface{ Scan(...interface{}) error }) (*models.PDF, error) {
 	p := &models.PDF{}
 	var pinned, cacheActive, deleted, rebuilding int
 	var cacheLastAccess sql.NullTime
+	var deletedAt sql.NullInt64
 	if err := r.Scan(
 		&p.ID, &p.Path, &p.Title, &p.CacheKey, &p.PageCount, &p.FileSize, &p.FileMtime,
 		&pinned, &cacheActive, &p.CacheSize, &p.CachedPages, &cacheLastAccess,
 		&deleted, &rebuilding, &p.CacheVersion, &p.ChangedPages,
 		&p.GoodNotesPath, &p.GoodNotesSize, &p.GoodNotesMtime, &p.CreatedAt, &p.UpdatedAt,
+		&deletedAt,
 	); err != nil {
 		return nil, err
 	}
@@ -201,6 +291,10 @@ func scanPDF(r interface{ Scan(...interface{}) error }) (*models.PDF, error) {
 	p.Deleted = deleted == 1
 	if cacheLastAccess.Valid {
 		p.CacheLastAccess = cacheLastAccess.Time
+	}
+	if deletedAt.Valid {
+		stamp := time.Unix(deletedAt.Int64, 0)
+		p.DeletedAt = &stamp
 	}
 	return p, nil
 }
@@ -298,23 +392,176 @@ func (db *Database) UpdateGoodNotesSource(id int64, path string, fileSize, fileM
 	return err
 }
 
-func (db *Database) MarkDeletedExcept(paths []string) error {
-	if len(paths) == 0 {
-		_, err := db.Exec(`UPDATE pdfs SET deleted = 1, updated_at = ? WHERE deleted = 0`, time.Now())
+// PDFRef 是扫描对账需要的最小记录集合：id、路径与缓存键。
+type PDFRef struct {
+	ID       int64
+	Path     string
+	CacheKey string
+}
+
+// PurgedPDF 描述一条已经被物理清理的记录，供上层删除对应的页面缓存目录。
+type PurgedPDF struct {
+	ID       int64
+	Path     string
+	CacheKey string
+}
+
+// ListActivePDFRefs 返回所有未删除记录的 id/路径/缓存键。
+// 扫描器据此判断哪些文件已经消失，过滤逻辑放在 Go 侧以便排除不可达目录。
+func (db *Database) ListActivePDFRefs() ([]PDFRef, error) {
+	rows, err := db.Query(`SELECT id, path, cache_key FROM pdfs WHERE deleted = 0`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var refs []PDFRef
+	for rows.Next() {
+		var ref PDFRef
+		if err := rows.Scan(&ref.ID, &ref.Path, &ref.CacheKey); err != nil {
+			return nil, err
+		}
+		refs = append(refs, ref)
+	}
+	return refs, rows.Err()
+}
+
+// CountActivePDFs 返回未删除记录数
+func (db *Database) CountActivePDFs() (int, error) {
+	var count int
+	err := db.QueryRow(`SELECT COUNT(*) FROM pdfs WHERE deleted = 0`).Scan(&count)
+	return count, err
+}
+
+// SoftDeletePDFs 把这些记录标记为已删除，并记录首次删除时间（用于宽限期）。
+// 已存在的 deleted_at 不会被刷新，保证宽限期从第一次发现文件消失时开始算。
+func (db *Database) SoftDeletePDFs(ids []int64) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	tx, err := db.Begin()
+	if err != nil {
 		return err
 	}
-	query := `UPDATE pdfs SET deleted = 1, updated_at = ? WHERE deleted = 0 AND path NOT IN (`
-	args := []interface{}{time.Now()}
-	for i, p := range paths {
-		if i > 0 {
-			query += ","
+	defer tx.Rollback()
+	now := time.Now()
+	for _, id := range ids {
+		if _, err := tx.Exec(`UPDATE pdfs
+			SET deleted = 1, deleted_at = COALESCE(deleted_at, ?), updated_at = ?
+			WHERE id = ? AND deleted = 0`, now.Unix(), now, id); err != nil {
+			return err
 		}
-		query += "?"
-		args = append(args, p)
 	}
-	query += ")"
-	_, err := db.Exec(query, args...)
-	return err
+	return tx.Commit()
+}
+
+// ListCacheKeys 返回所有仍占用缓存目录的 cache_key（含已软删除但尚未清理的记录）。
+// 扫描对账时用它判断磁盘上的缓存目录是否还有归属。
+func (db *Database) ListCacheKeys() ([]string, error) {
+	rows, err := db.Query(`SELECT cache_key FROM pdfs WHERE cache_key != ''`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var keys []string
+	for rows.Next() {
+		var key string
+		if err := rows.Scan(&key); err != nil {
+			return nil, err
+		}
+		keys = append(keys, key)
+	}
+	return keys, rows.Err()
+}
+
+// PurgeDeletedPDFs 物理删除超过宽限期的记录，连同它的目录项与用户标记。
+// cutoff 是最晚可保留的删除时间：deleted_at 早于它的记录会被清理。
+// 返回被删除的记录，调用方负责清理对应的缓存目录。
+func (db *Database) PurgeDeletedPDFs(cutoff time.Time) ([]PurgedPDF, error) {
+	tx, err := db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	cutoffUnix := cutoff.Unix()
+	rows, err := tx.Query(`SELECT id, path, cache_key FROM pdfs
+		WHERE deleted = 1 AND (deleted_at IS NULL OR deleted_at <= ?)`, cutoffUnix)
+	if err != nil {
+		return nil, err
+	}
+	var purged []PurgedPDF
+	for rows.Next() {
+		var item PurgedPDF
+		if err := rows.Scan(&item.ID, &item.Path, &item.CacheKey); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		purged = append(purged, item)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	rows.Close()
+
+	if len(purged) == 0 {
+		return nil, nil
+	}
+
+	// 外键已经带 ON DELETE CASCADE，这里显式删除是为了兼容尚未迁移的旧库。
+	for _, item := range purged {
+		if _, err := tx.Exec(`DELETE FROM page_marks WHERE pdf_id = ?`, item.ID); err != nil {
+			return nil, err
+		}
+		if _, err := tx.Exec(`DELETE FROM pdfs WHERE id = ?`, item.ID); err != nil {
+			return nil, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return purged, nil
+}
+
+// CleanupOrphanMarks 删除指向不存在 PDF 的标记（历史遗留或外部改库造成）。
+func (db *Database) CleanupOrphanMarks() (int64, error) {
+	res, err := db.Exec(`DELETE FROM page_marks WHERE pdf_id NOT IN (SELECT id FROM pdfs)`)
+	if err != nil {
+		return 0, err
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return 0, nil
+	}
+	return affected, nil
+}
+
+// MaybeVacuum 在距上次 VACUUM 超过 minInterval 时回收数据库空闲页。
+// minInterval 不为正数时不做任何事；时间戳记录在 meta 表，跨重启生效。
+func (db *Database) MaybeVacuum(minInterval time.Duration) (bool, error) {
+	if minInterval <= 0 {
+		return false, nil
+	}
+	var last string
+	db.QueryRow(`SELECT value FROM meta WHERE key = ?`, keyLastVacuum).Scan(&last)
+	if last != "" {
+		if parsed, err := time.Parse(time.RFC3339, last); err == nil && time.Since(parsed) < minInterval {
+			return false, nil
+		}
+	}
+
+	if _, err := db.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+		log.Printf("maintenance: wal checkpoint failed: %v", err)
+	}
+	if _, err := db.Exec(`VACUUM`); err != nil {
+		return false, err
+	}
+	if _, err := db.Exec(`INSERT INTO meta (key, value) VALUES (?, ?)
+		ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+		keyLastVacuum, time.Now().Format(time.RFC3339)); err != nil {
+		return true, err
+	}
+	return true, nil
 }
 
 func (db *Database) PinPDF(id int64) error {
@@ -528,26 +775,6 @@ func (db *Database) GetMaxSortOrder(pdfID int64) (float64, error) {
 	var maxOrder float64
 	err := db.QueryRow(`SELECT COALESCE(MAX(sort_order), 0) FROM page_marks WHERE pdf_id = ?`, pdfID).Scan(&maxOrder)
 	return maxOrder, err
-}
-
-// CleanupDeletedPDFs 清理已删除PDF的缓存目录和标记（M9: 防止磁盘无界增长）
-// 返回被清理的PDF ID列表
-func (db *Database) CleanupDeletedPDFs() []int64 {
-	rows, err := db.Query(`SELECT id FROM pdfs WHERE deleted = 1 AND cached_pages > 0`)
-	if err != nil {
-		return nil
-	}
-	defer rows.Close()
-	var ids []int64
-	for rows.Next() {
-		var id int64
-		rows.Scan(&id)
-		ids = append(ids, id)
-		// 清除缓存统计和标记
-		db.ClearCacheStats(id)
-		db.Exec(`DELETE FROM page_marks WHERE pdf_id = ?`, id)
-	}
-	return ids
 }
 
 // HasOutlineMarks 检查是否已提取过PDF目录

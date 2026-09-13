@@ -647,6 +647,13 @@ func (s *Server) extractOutline(pdf *models.PDF) int {
 		log.Printf("failed to store outline for PDF %d: %v", pdf.ID, err)
 		return 0
 	}
+	// 手动从 PDF 提取的目录与 GoodNotes 来源互斥：清掉来源签名，
+	// 这样下一轮扫描会重新以 .goodnotes 为准，避免"来源显示 GoodNotes、内容是 PDF 目录"。
+	if pdf.GoodNotesPath != "" {
+		if err := s.db.UpdateGoodNotesSource(pdf.ID, "", 0, 0); err != nil {
+			log.Printf("failed to clear GoodNotes source for PDF %d: %v", pdf.ID, err)
+		}
+	}
 	log.Printf("extracted %d outline entries for PDF %d", len(entries), pdf.ID)
 	return len(entries)
 }

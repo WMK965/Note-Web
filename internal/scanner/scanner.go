@@ -20,27 +20,36 @@ import (
 
 // Scanner 是目录扫描器，负责发现和索引 PDF 文件
 type Scanner struct {
-	db       *db.Database       // 数据库实例
-	renderer *renderer.Renderer // 渲染器（用于获取PDF页数和标题）
-	cache    cacheInvalidator   // 缓存失效器
-	dirs     []string           // 要扫描的目录列表
-	interval time.Duration      // 定时扫描间隔
-	stopCh   chan struct{}      // 停止信号通道
+	db             *db.Database       // 数据库实例
+	renderer       *renderer.Renderer // 渲染器（用于获取PDF页数和标题）
+	cache          cacheInvalidator   // 缓存失效器
+	dirs           []string           // 要扫描的目录列表
+	interval       time.Duration      // 定时扫描间隔
+	retention      time.Duration      // 文件消失后记录的保留时长（0 表示不保留）
+	vacuumInterval time.Duration      // 自动 VACUUM 的最小间隔
+	stopCh         chan struct{}      // 停止信号通道
+
+	lastFound   int  // 上一轮扫描发现的 PDF 数量（用于识别异常骤降）
+	hasBaseline bool // 是否已有上一轮扫描结果
 }
 
 type cacheInvalidator interface {
 	InvalidatePDF(pdfID int64) error
+	RemoveCacheDir(cacheKey string) error
+	SweepOrphanCacheDirs(liveKeys map[string]bool) (int, int64, error)
 }
 
 // New 创建扫描器实例
-func New(database *db.Database, r *renderer.Renderer, cfg config.PDFConfig, cache cacheInvalidator) *Scanner {
+func New(database *db.Database, r *renderer.Renderer, cfg config.PDFConfig, dbCfg config.DatabaseConfig, cache cacheInvalidator) *Scanner {
 	return &Scanner{
-		db:       database,
-		renderer: r,
-		cache:    cache,
-		dirs:     cfg.Dirs,
-		interval: time.Duration(cfg.ScanInterval) * time.Second,
-		stopCh:   make(chan struct{}),
+		db:             database,
+		renderer:       r,
+		cache:          cache,
+		dirs:           cfg.Dirs,
+		interval:       time.Duration(cfg.ScanInterval) * time.Second,
+		retention:      cfg.RetentionDuration(),
+		vacuumInterval: dbCfg.VacuumDuration(),
+		stopCh:         make(chan struct{}),
 	}
 }
 
@@ -54,12 +63,15 @@ func (s *Scanner) Scan() error {
 	foundPaths := make(map[string]bool)
 	pdfFiles := make(map[string]scannedFile)
 	goodNotesFiles := make(map[string]scannedFile)
+	var failedDirs []string
 
 	// 遍历每个配置目录
 	for _, dir := range s.dirs {
+		walkFailed := false
 		err := filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
 			if err != nil {
 				log.Printf("scan error at %s: %v", path, err)
+				walkFailed = true
 				return nil // 跳过错误，继续扫描
 			}
 			if d.IsDir() {
@@ -94,7 +106,11 @@ func (s *Scanner) Scan() error {
 			return nil
 		})
 		if err != nil {
+			walkFailed = true
 			log.Printf("scan failed for dir %s: %v", dir, err)
+		}
+		if walkFailed {
+			failedDirs = append(failedDirs, dir)
 		}
 	}
 
@@ -113,12 +129,10 @@ func (s *Scanner) Scan() error {
 		}
 	}
 
-	// 将扫描结果中不存在的数据库记录标记为已删除
-	if err := s.db.MarkDeletedExcept(mapKeys(foundPaths)); err != nil {
-		log.Printf("failed to mark deleted: %v", err)
-	}
+	// 对账数据库与磁盘：软删除消失的文件、清理超期记录与孤儿缓存
+	s.reconcile(foundPaths, failedDirs)
 
-	count, _ := s.countActivePDFs()
+	count, _ := s.db.CountActivePDFs()
 	log.Printf("scan complete: %d PDFs found", count)
 	return nil
 }
@@ -255,22 +269,4 @@ func (s *Scanner) Start() {
 // Stop 停止定时扫描
 func (s *Scanner) Stop() {
 	close(s.stopCh)
-}
-
-// countActivePDFs 统计数据库中未删除的PDF数量
-func (s *Scanner) countActivePDFs() (int, error) {
-	pdfs, err := s.db.ListPDFs()
-	if err != nil {
-		return 0, err
-	}
-	return len(pdfs), nil
-}
-
-// mapKeys 将 map 的键提取为 slice
-func mapKeys(m map[string]bool) []string {
-	keys := make([]string, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
-	}
-	return keys
 }

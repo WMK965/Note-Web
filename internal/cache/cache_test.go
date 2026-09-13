@@ -276,3 +276,53 @@ func TestGetPageRefreshesChangedUnpinnedPDF(t *testing.T) {
 		t.Errorf("更新后内容 = %q, 期望重新渲染的新内容", got)
 	}
 }
+
+// 无主缓存目录（含 .tmp 残片）应被清理，存活目录与无关目录必须保留
+func TestSweepOrphanCacheDirs(t *testing.T) {
+	e := newEnv(t, 1)
+	liveKey := "0123456789abcdef"
+	orphanKey := "fedcba9876543210"
+	for _, name := range []string{liveKey, orphanKey, orphanKey + ".tmp"} {
+		dir := filepath.Join(e.cfg.CacheDir, name)
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			t.Fatalf("mkdir %s: %v", name, err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "p0001.jpg"), []byte("page"), 0644); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+	unrelated := filepath.Join(e.cfg.CacheDir, "keepme")
+	if err := os.MkdirAll(unrelated, 0755); err != nil {
+		t.Fatalf("mkdir unrelated: %v", err)
+	}
+
+	removed, freed, err := e.mgr.SweepOrphanCacheDirs(map[string]bool{liveKey: true})
+	if err != nil {
+		t.Fatalf("sweep orphan cache dirs: %v", err)
+	}
+	if removed != 2 {
+		t.Errorf("removed = %d, want 2 (orphan dir and .tmp leftover)", removed)
+	}
+	if freed <= 0 {
+		t.Errorf("freed = %d, want a positive byte count", freed)
+	}
+	if _, err := os.Stat(filepath.Join(e.cfg.CacheDir, liveKey)); err != nil {
+		t.Errorf("live cache dir was removed: %v", err)
+	}
+	if _, err := os.Stat(unrelated); err != nil {
+		t.Errorf("unrelated dir was removed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(e.cfg.CacheDir, orphanKey)); !os.IsNotExist(err) {
+		t.Errorf("orphan cache dir still present: %v", err)
+	}
+}
+
+// RemoveCacheDir 必须拒绝不像缓存键的名字，避免误删缓存根目录下的其它内容
+func TestRemoveCacheDirRejectsUnexpectedKey(t *testing.T) {
+	e := newEnv(t, 1)
+	for _, key := range []string{"", "..", "not-a-cache-key", "0123456789abcde"} {
+		if err := e.mgr.RemoveCacheDir(key); err == nil {
+			t.Errorf("RemoveCacheDir(%q) succeeded, want an error", key)
+		}
+	}
+}

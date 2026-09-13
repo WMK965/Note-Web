@@ -38,8 +38,18 @@ type ProxyConfig struct {
 
 // PDFConfig 是 PDF 目录扫描配置
 type PDFConfig struct {
-	Dirs         []string `yaml:"dirs"`          // PDF 文件所在目录列表（支持多目录）
-	ScanInterval int      `yaml:"scan_interval"` // 定时扫描间隔（秒），默认 300（5分钟）
+	Dirs          []string `yaml:"dirs"`           // PDF 文件所在目录列表（支持多目录）
+	ScanInterval  int      `yaml:"scan_interval"`  // 定时扫描间隔（秒），默认 300（5分钟）
+	RetentionDays int      `yaml:"retention_days"` // 文件消失后保留记录的宽限天数，默认 30；0 表示下一轮扫描立即清理
+}
+
+// RetentionDuration 将 RetentionDays 转换为 time.Duration
+// 负数按 0 处理，0 表示不保留宽限期
+func (p PDFConfig) RetentionDuration() time.Duration {
+	if p.RetentionDays <= 0 {
+		return 0
+	}
+	return time.Duration(p.RetentionDays) * 24 * time.Hour
 }
 
 // RenderConfig 是页面渲染参数
@@ -85,7 +95,18 @@ type PassiveCacheConfig struct {
 
 // DatabaseConfig 是数据库配置
 type DatabaseConfig struct {
-	Path string `yaml:"path"` // SQLite 数据库文件路径，默认 "/data/note-web.db"
+	Path           string `yaml:"path"`            // SQLite 数据库文件路径，默认 "/data/note-web.db"
+	VacuumInterval string `yaml:"vacuum_interval"` // 自动 VACUUM 的最小间隔，默认 "168h"（7天）
+}
+
+// VacuumDuration 将 VacuumInterval 字符串解析为 time.Duration
+// 解析失败或不为正数时返回默认值 7 天
+func (d DatabaseConfig) VacuumDuration() time.Duration {
+	interval, err := time.ParseDuration(d.VacuumInterval)
+	if err != nil || interval <= 0 {
+		return 7 * 24 * time.Hour
+	}
+	return interval
 }
 
 // Default 返回默认配置
@@ -103,8 +124,9 @@ func Default() *Config {
 			BasePath: "",
 		},
 		PDF: PDFConfig{
-			Dirs:         []string{"/documents"},
-			ScanInterval: 300,
+			Dirs:          []string{"/documents"},
+			ScanInterval:  300,
+			RetentionDays: 30,
 		},
 		Render: RenderConfig{
 			JpegQuality: 80,
@@ -120,7 +142,8 @@ func Default() *Config {
 			MaxSizeMB: 2048,
 		},
 		Database: DatabaseConfig{
-			Path: "/data/note-web.db",
+			Path:           "/data/note-web.db",
+			VacuumInterval: "168h",
 		},
 		CacheDir: "/data/cache",
 	}
@@ -179,6 +202,9 @@ func (c *Config) Validate() error {
 	if c.PDF.ScanInterval <= 0 {
 		return fmt.Errorf("pdf.scan_interval must be positive")
 	}
+	if c.PDF.RetentionDays < 0 {
+		return fmt.Errorf("pdf.retention_days must not be negative")
+	}
 	if c.Render.JpegQuality < 1 || c.Render.JpegQuality > 100 {
 		return fmt.Errorf("render.jpeg_quality must be 1-100")
 	}
@@ -196,6 +222,12 @@ func (c *Config) Validate() error {
 	}
 	if c.Database.Path == "" || strings.Contains(c.Database.Path, "..") {
 		return fmt.Errorf("invalid database.path")
+	}
+	if c.Database.VacuumInterval != "" {
+		interval, err := time.ParseDuration(c.Database.VacuumInterval)
+		if err != nil || interval <= 0 {
+			return fmt.Errorf("database.vacuum_interval must be a positive duration, got %q", c.Database.VacuumInterval)
+		}
 	}
 	return nil
 }

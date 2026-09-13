@@ -3,7 +3,9 @@ package scanner
 import (
 	"archive/zip"
 	"bytes"
+	"database/sql"
 	"encoding/binary"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -12,6 +14,173 @@ import (
 	"note-web/internal/db"
 	"note-web/internal/util"
 )
+
+// fakeCache 记录扫描器对缓存目录的操作，便于断言清理行为
+type fakeCache struct {
+	removed []string
+}
+
+func (f *fakeCache) InvalidatePDF(int64) error { return nil }
+
+func (f *fakeCache) RemoveCacheDir(cacheKey string) error {
+	f.removed = append(f.removed, cacheKey)
+	return nil
+}
+
+func (f *fakeCache) SweepOrphanCacheDirs(map[string]bool) (int, int64, error) {
+	return 0, 0, nil
+}
+
+// 文件消失后先软删除（宽限期内保留标记），宽限期结束再连同缓存一起清理
+func TestScanSoftDeletesThenPurgesMissingPDF(t *testing.T) {
+	dir := t.TempDir()
+	pdfPath := filepath.Join(dir, "gone.pdf")
+	if err := os.WriteFile(pdfPath, []byte("%PDF-1.4 minimal"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(pdfPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	database, err := db.Init(filepath.Join(dir, "note-web.db"))
+	if err != nil {
+		t.Fatalf("db init: %v", err)
+	}
+	t.Cleanup(func() { database.Close() })
+	key := util.CacheKey(pdfPath)
+	id, err := database.AddPDF(pdfPath, "gone", key, 3, info.Size(), info.ModTime().Unix())
+	if err != nil {
+		t.Fatalf("add pdf: %v", err)
+	}
+	if _, err := database.AddMark(id, 2, "用户标记", 0, 0, 1); err != nil {
+		t.Fatalf("add mark: %v", err)
+	}
+	if err := os.Remove(pdfPath); err != nil {
+		t.Fatalf("remove pdf: %v", err)
+	}
+
+	cache := &fakeCache{}
+	cfg := config.PDFConfig{Dirs: []string{dir}, ScanInterval: 300, RetentionDays: 30}
+	if err := New(database, nil, cfg, config.DatabaseConfig{}, cache).Scan(); err != nil {
+		t.Fatalf("first scan: %v", err)
+	}
+
+	pdf, err := database.GetPDF(id)
+	if err != nil {
+		t.Fatalf("record disappeared inside the grace period: %v", err)
+	}
+	if !pdf.Deleted || pdf.DeletedAt == nil {
+		t.Fatalf("record was not soft-deleted: deleted=%v deletedAt=%v", pdf.Deleted, pdf.DeletedAt)
+	}
+	if marks, err := database.ListMarks(id); err != nil || len(marks) != 1 {
+		t.Fatalf("marks inside the grace period = %+v (err=%v)", marks, err)
+	}
+
+	// 宽限期为 0：下一轮扫描直接物理清理
+	immediate := config.PDFConfig{Dirs: []string{dir}, ScanInterval: 300, RetentionDays: 0}
+	if err := New(database, nil, immediate, config.DatabaseConfig{}, cache).Scan(); err != nil {
+		t.Fatalf("second scan: %v", err)
+	}
+
+	if _, err := database.GetPDF(id); err != sql.ErrNoRows {
+		t.Errorf("record after purge error = %v, want sql.ErrNoRows", err)
+	}
+	if marks, err := database.ListMarks(id); err != nil || len(marks) != 0 {
+		t.Errorf("marks after purge = %+v (err=%v)", marks, err)
+	}
+	if len(cache.removed) != 1 || cache.removed[0] != key {
+		t.Errorf("cache removals = %v, want [%s]", cache.removed, key)
+	}
+}
+
+// 目录整体不可达（挂载掉线、路径写错）时不能把下面的记录判成已删除
+func TestScanKeepsRecordsWhenDirectoryUnavailable(t *testing.T) {
+	dir := t.TempDir()
+	offlineDir := filepath.Join(dir, "offline")
+	pdfPath := filepath.Join(offlineDir, "book.pdf")
+
+	database, err := db.Init(filepath.Join(dir, "note-web.db"))
+	if err != nil {
+		t.Fatalf("db init: %v", err)
+	}
+	t.Cleanup(func() { database.Close() })
+	id, err := database.AddPDF(pdfPath, "book", util.CacheKey(pdfPath), 5, 10, 1)
+	if err != nil {
+		t.Fatalf("add pdf: %v", err)
+	}
+
+	cfg := config.PDFConfig{Dirs: []string{offlineDir}, ScanInterval: 300, RetentionDays: 0}
+	if err := New(database, nil, cfg, config.DatabaseConfig{}, nil).Scan(); err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+
+	pdf, err := database.GetPDF(id)
+	if err != nil {
+		t.Fatalf("record was purged although its directory could not be scanned: %v", err)
+	}
+	if pdf.Deleted {
+		t.Error("record was soft-deleted although its directory could not be scanned")
+	}
+}
+
+// 发现数量骤降时只软删除、推迟物理清理，下一轮恢复正常后再清理
+func TestScanDefersPurgeOnDrasticDrop(t *testing.T) {
+	dir := t.TempDir()
+	database, err := db.Init(filepath.Join(dir, "note-web.db"))
+	if err != nil {
+		t.Fatalf("db init: %v", err)
+	}
+	t.Cleanup(func() { database.Close() })
+
+	var paths []string
+	for i := 0; i < 10; i++ {
+		path := filepath.Join(dir, fmt.Sprintf("book-%02d.pdf", i))
+		if err := os.WriteFile(path, []byte("%PDF-1.4 minimal"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := database.AddPDF(path, fmt.Sprintf("book-%02d", i), util.CacheKey(path), 5, info.Size(), info.ModTime().Unix()); err != nil {
+			t.Fatalf("add pdf: %v", err)
+		}
+		paths = append(paths, path)
+	}
+
+	cfg := config.PDFConfig{Dirs: []string{dir}, ScanInterval: 300, RetentionDays: 0}
+	scanner := New(database, nil, cfg, config.DatabaseConfig{}, nil)
+	if err := scanner.Scan(); err != nil { // 第一轮建立 10 个文件的基线
+		t.Fatalf("baseline scan: %v", err)
+	}
+
+	for _, path := range paths[:6] { // 移走 6 个，跌幅 60%
+		if err := os.Remove(path); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := scanner.Scan(); err != nil {
+		t.Fatalf("scan after drop: %v", err)
+	}
+
+	for _, path := range paths[:6] {
+		pdf, err := database.GetPDFByPath(path)
+		if err != nil {
+			t.Fatalf("record %s was purged on a suspicious scan: %v", path, err)
+		}
+		if !pdf.Deleted {
+			t.Errorf("record %s was not soft-deleted", path)
+		}
+	}
+
+	// 下一轮扫描结果稳定，推迟的清理应当执行
+	if err := scanner.Scan(); err != nil {
+		t.Fatalf("third scan: %v", err)
+	}
+	if _, err := database.GetPDFByPath(paths[0]); err != sql.ErrNoRows {
+		t.Errorf("deferred purge did not run on the next stable scan: %v", err)
+	}
+}
 
 func TestScanImportsMatchingGoodNotesOutline(t *testing.T) {
 	dir := t.TempDir()
@@ -35,8 +204,8 @@ func TestScanImportsMatchingGoodNotesOutline(t *testing.T) {
 
 	goodNotesPath := filepath.Join(dir, "book.goodnotes")
 	writeGoodNotesArchive(t, goodNotesPath)
-	cfg := config.PDFConfig{Dirs: []string{dir}, ScanInterval: 300}
-	s := New(database, nil, cfg, nil)
+	cfg := config.PDFConfig{Dirs: []string{dir}, ScanInterval: 300, RetentionDays: 30}
+	s := New(database, nil, cfg, config.DatabaseConfig{}, nil)
 	if err := s.Scan(); err != nil {
 		t.Fatalf("scan: %v", err)
 	}

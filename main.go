@@ -66,7 +66,7 @@ func main() {
 	cm := cache.New(database, r, cfg)
 
 	// 创建目录扫描器（递归扫描配置目录，自动发现PDF文件）
-	s := scanner.New(database, r, cfg.PDF, cm)
+	s := scanner.New(database, r, cfg.PDF, cfg.Database, cm)
 	if err := s.Scan(); err != nil { // 启动时立即执行一次完整扫描
 		log.Printf("initial scan failed: %v", err)
 	}

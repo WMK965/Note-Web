@@ -78,6 +78,81 @@ func (m *Manager) pdfDir(cacheKey string) string {
 	return filepath.Join(m.cacheDir, cacheKey)
 }
 
+// RemoveCacheDir 删除某个 cache_key 对应的全部缓存产物（正式目录与 .tmp/.old 残片）。
+func (m *Manager) RemoveCacheDir(cacheKey string) error {
+	if !looksLikeCacheKey(cacheKey) {
+		return fmt.Errorf("refusing to remove cache with unexpected key %q", cacheKey)
+	}
+	for _, dir := range []string{
+		m.pdfDir(cacheKey),
+		filepath.Join(m.cacheDir, cacheKey+".tmp"),
+		filepath.Join(m.cacheDir, cacheKey+".old"),
+	} {
+		if err := os.RemoveAll(dir); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// SweepOrphanCacheDirs 删除缓存根目录下不再对应任何存活记录的目录。
+// liveKeys 是当前存活记录的 cache_key 集合；只有形如缓存键的目录才会被删除，
+// 避免误删用户放在同一目录下的其它文件。返回删除的目录数与释放的字节数。
+func (m *Manager) SweepOrphanCacheDirs(liveKeys map[string]bool) (int, int64, error) {
+	entries, err := os.ReadDir(m.cacheDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, 0, nil
+		}
+		return 0, 0, err
+	}
+	removed := 0
+	var freed int64
+	for _, entry := range entries {
+		key := strings.TrimSuffix(strings.TrimSuffix(entry.Name(), ".tmp"), ".old")
+		if !looksLikeCacheKey(key) || liveKeys[key] {
+			continue
+		}
+		full := filepath.Join(m.cacheDir, entry.Name())
+		size := pathSize(full)
+		if err := os.RemoveAll(full); err != nil {
+			return removed, freed, err
+		}
+		removed++
+		freed += size
+	}
+	return removed, freed, nil
+}
+
+// looksLikeCacheKey 校验目录名是否是 CacheKey 生成的形态（16位小写十六进制），
+// 用于避免清扫时误删缓存目录里的无关内容。
+func looksLikeCacheKey(key string) bool {
+	if len(key) != 16 {
+		return false
+	}
+	for _, r := range key {
+		isDigit := r >= '0' && r <= '9'
+		isHexLetter := r >= 'a' && r <= 'f'
+		if !isDigit && !isHexLetter {
+			return false
+		}
+	}
+	return true
+}
+
+// pathSize 统计文件或目录占用的字节数，出错时按 0 处理。
+func pathSize(path string) int64 {
+	var total int64
+	_ = filepath.Walk(path, func(_ string, info os.FileInfo, err error) error {
+		if err != nil || info == nil || info.IsDir() {
+			return nil
+		}
+		total += info.Size()
+		return nil
+	})
+	return total
+}
+
 // pagePath 返回某页的缓存文件路径（格式：{cache_key}/p0001.jpg）
 func (m *Manager) pagePath(cacheKey string, pageNum int) string {
 	return filepath.Join(m.pdfDir(cacheKey), fmt.Sprintf("p%04d.jpg", pageNum))
@@ -634,21 +709,10 @@ func (m *Manager) StartEviction() {
 	}()
 }
 
-// evict 执行一轮LRU淘汰与软删除清理
-// M9: 先清理已删除PDF的缓存文件和标记，再检查缓存大小
+// evict 执行一轮LRU淘汰。
+// 已删除记录的清理已经移到扫描器（见 scanner.reconcile），
+// 这里只负责被动缓存的容量控制。
 func (m *Manager) evict() {
-	// 清理已删除PDF的缓存（M9）
-	ids := m.db.CleanupDeletedPDFs()
-	for _, id := range ids {
-		// 获取cache_key来删除缓存目录
-		pdf, err := m.db.GetPDF(id)
-		if err != nil {
-			continue
-		}
-		dir := m.pdfDir(pdf.CacheKey)
-		os.RemoveAll(dir)
-	}
-
 	size, err := m.db.GetTotalCacheSize()
 	if err != nil {
 		log.Printf("eviction: failed to get cache size: %v", err)
