@@ -93,3 +93,49 @@ func TestAddOutlineMarksReplacesPrevious(t *testing.T) {
 		t.Fatalf("目录项 = %+v，期望只有“新目录”", marks)
 	}
 }
+
+func TestReplaceOutlineMarksFromGoodNotesRecordsSource(t *testing.T) {
+	database := newTestDB(t)
+	id, err := database.AddPDF("/documents/book.pdf", "book", "key-book", 10, 10, 1)
+	if err != nil {
+		t.Fatalf("add pdf: %v", err)
+	}
+	userMarkID, err := database.AddMark(id, 3, "用户标记", 0, 0, 1)
+	if err != nil {
+		t.Fatalf("add user mark: %v", err)
+	}
+
+	entries := []models.OutlineEntry{
+		{Level: 0, Page: 2, Title: "第一章"},
+		{Level: 1, Page: 3, Title: "第一节"},
+	}
+	if err := database.ReplaceOutlineMarksFromGoodNotes(id, entries, "/documents/book.goodnotes", 123, 456); err != nil {
+		t.Fatalf("replace GoodNotes outline: %v", err)
+	}
+	pdf, err := database.GetPDF(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pdf.GoodNotesPath != "/documents/book.goodnotes" || pdf.GoodNotesSize != 123 || pdf.GoodNotesMtime != 456 {
+		t.Errorf("GoodNotes source = (%q, %d, %d)", pdf.GoodNotesPath, pdf.GoodNotesSize, pdf.GoodNotesMtime)
+	}
+	marks, err := database.ListMarks(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(marks) != 3 {
+		t.Fatalf("mark count = %d, want 3", len(marks))
+	}
+	foundUser := false
+	for _, mark := range marks {
+		if mark.ID == userMarkID {
+			foundUser = true
+			if mark.IsOutline {
+				t.Error("user mark became an outline mark")
+			}
+		}
+	}
+	if !foundUser {
+		t.Fatal("user mark was lost while replacing the outline")
+	}
+}

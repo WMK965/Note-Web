@@ -57,6 +57,9 @@ func migrate(db *sql.DB) error {
 			cache_last_access TIMESTAMP,
 			cache_version INTEGER NOT NULL DEFAULT 0,
 			changed_pages TEXT NOT NULL DEFAULT '',
+			goodnotes_path TEXT NOT NULL DEFAULT '',
+			goodnotes_size INTEGER NOT NULL DEFAULT 0,
+			goodnotes_mtime INTEGER NOT NULL DEFAULT 0,
 			deleted INTEGER NOT NULL DEFAULT 0,
 			rebuilding INTEGER NOT NULL DEFAULT 0,
 			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -93,6 +96,22 @@ func migrate(db *sql.DB) error {
 	if colCount == 0 {
 		if _, err := db.Exec(`ALTER TABLE pdfs ADD COLUMN changed_pages TEXT NOT NULL DEFAULT ''`); err != nil {
 			log.Printf("migration: failed to add changed_pages column: %v", err)
+		}
+	}
+
+	for _, column := range []struct {
+		name       string
+		definition string
+	}{
+		{name: "goodnotes_path", definition: "TEXT NOT NULL DEFAULT ''"},
+		{name: "goodnotes_size", definition: "INTEGER NOT NULL DEFAULT 0"},
+		{name: "goodnotes_mtime", definition: "INTEGER NOT NULL DEFAULT 0"},
+	} {
+		db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('pdfs') WHERE name = ?`, column.name).Scan(&colCount)
+		if colCount == 0 {
+			if _, err := db.Exec(`ALTER TABLE pdfs ADD COLUMN ` + column.name + ` ` + column.definition); err != nil {
+				log.Printf("migration: failed to add %s column: %v", column.name, err)
+			}
 		}
 	}
 
@@ -142,6 +161,9 @@ func migrate(db *sql.DB) error {
 		if _, err := db.Exec(`DELETE FROM page_marks WHERE is_outline = 1`); err != nil {
 			log.Printf("migration: failed to drop stale outline marks: %v", err)
 		}
+		if _, err := db.Exec(`UPDATE pdfs SET goodnotes_path = '', goodnotes_size = 0, goodnotes_mtime = 0`); err != nil {
+			log.Printf("migration: failed to reset GoodNotes source state: %v", err)
+		}
 		if _, err := db.Exec(`INSERT INTO meta (key, value) VALUES (?, ?)
 			ON CONFLICT(key) DO UPDATE SET value = excluded.value`, keyOutlineParser, outlineParserVersion); err != nil {
 			log.Printf("migration: failed to record outline parser version: %v", err)
@@ -154,12 +176,13 @@ func migrate(db *sql.DB) error {
 // 目录解析逻辑的版本号，变更解析方式时递增即可让旧数据重新提取
 const (
 	keyOutlineParser     = "outline_parser"
-	outlineParserVersion = "2"
+	outlineParserVersion = "4"
 )
 
 const pdfColumns = `id, path, title, cache_key, page_count, file_size, file_mtime,
 		       pinned, cache_active, cache_size, cached_pages, cache_last_access,
-		       deleted, rebuilding, cache_version, changed_pages, created_at, updated_at`
+		       deleted, rebuilding, cache_version, changed_pages,
+		       goodnotes_path, goodnotes_size, goodnotes_mtime, created_at, updated_at`
 
 func scanPDF(r interface{ Scan(...interface{}) error }) (*models.PDF, error) {
 	p := &models.PDF{}
@@ -168,7 +191,8 @@ func scanPDF(r interface{ Scan(...interface{}) error }) (*models.PDF, error) {
 	if err := r.Scan(
 		&p.ID, &p.Path, &p.Title, &p.CacheKey, &p.PageCount, &p.FileSize, &p.FileMtime,
 		&pinned, &cacheActive, &p.CacheSize, &p.CachedPages, &cacheLastAccess,
-		&deleted, &rebuilding, &p.CacheVersion, &p.ChangedPages, &p.CreatedAt, &p.UpdatedAt,
+		&deleted, &rebuilding, &p.CacheVersion, &p.ChangedPages,
+		&p.GoodNotesPath, &p.GoodNotesSize, &p.GoodNotesMtime, &p.CreatedAt, &p.UpdatedAt,
 	); err != nil {
 		return nil, err
 	}
@@ -265,6 +289,12 @@ func (db *Database) ListWatchablePDFs() ([]*models.PDF, error) {
 func (db *Database) UpdatePDFMetadata(id int64, title string, pageCount int, fileSize int64, fileMtime int64) error {
 	_, err := db.Exec(`UPDATE pdfs SET title = ?, page_count = ?, file_size = ?, file_mtime = ?, updated_at = ? WHERE id = ?`,
 		title, pageCount, fileSize, fileMtime, time.Now(), id)
+	return err
+}
+
+func (db *Database) UpdateGoodNotesSource(id int64, path string, fileSize, fileMtime int64) error {
+	_, err := db.Exec(`UPDATE pdfs SET goodnotes_path = ?, goodnotes_size = ?, goodnotes_mtime = ?, updated_at = ? WHERE id = ?`,
+		path, fileSize, fileMtime, time.Now(), id)
 	return err
 }
 
@@ -528,8 +558,19 @@ func (db *Database) HasOutlineMarks(pdfID int64) (bool, error) {
 }
 
 func (db *Database) DeleteOutlineMarks(pdfID int64) error {
-	_, err := db.Exec(`DELETE FROM page_marks WHERE pdf_id = ? AND is_outline = 1`, pdfID)
-	return err
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	if err := detachOutlineChildren(tx, pdfID); err != nil {
+		tx.Rollback()
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM page_marks WHERE pdf_id = ? AND is_outline = 1`, pdfID); err != nil {
+		tx.Rollback()
+		return err
+	}
+	return tx.Commit()
 }
 
 func (db *Database) AddOutlineMarks(pdfID int64, entries []models.OutlineEntry) error {
@@ -537,7 +578,53 @@ func (db *Database) AddOutlineMarks(pdfID int64, entries []models.OutlineEntry) 
 	if err != nil {
 		return err
 	}
+	if err := addOutlineMarks(tx, pdfID, entries); err != nil {
+		tx.Rollback()
+		return err
+	}
+	return tx.Commit()
+}
 
+// ReplaceOutlineMarksFromGoodNotes atomically replaces generated outline marks
+// and records the archive signature that produced them.
+func (db *Database) ReplaceOutlineMarksFromGoodNotes(pdfID int64, entries []models.OutlineEntry, path string, fileSize, fileMtime int64) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	if err := detachOutlineChildren(tx, pdfID); err != nil {
+		tx.Rollback()
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM page_marks WHERE pdf_id = ? AND is_outline = 1`, pdfID); err != nil {
+		tx.Rollback()
+		return err
+	}
+	if err := addOutlineMarks(tx, pdfID, entries); err != nil {
+		tx.Rollback()
+		return err
+	}
+	if _, err := tx.Exec(`UPDATE pdfs SET goodnotes_path = ?, goodnotes_size = ?, goodnotes_mtime = ?, updated_at = ? WHERE id = ?`,
+		path, fileSize, fileMtime, time.Now(), pdfID); err != nil {
+		tx.Rollback()
+		return err
+	}
+	return tx.Commit()
+}
+
+type statementExecutor interface {
+	Exec(query string, args ...interface{}) (sql.Result, error)
+}
+
+func detachOutlineChildren(executor statementExecutor, pdfID int64) error {
+	_, err := executor.Exec(`UPDATE page_marks SET parent_id = NULL, level = 0
+		WHERE pdf_id = ? AND is_outline = 0 AND parent_id IN (
+			SELECT id FROM page_marks WHERE pdf_id = ? AND is_outline = 1
+		)`, pdfID, pdfID)
+	return err
+}
+
+func addOutlineMarks(executor statementExecutor, pdfID int64, entries []models.OutlineEntry) error {
 	// 按层级维护祖先栈，为每个目录项算出父级：
 	// 前端按 parent_id 渲染树形目录，缺失父级就会退化为平铺列表
 	var stack []int64
@@ -556,20 +643,18 @@ func (db *Database) AddOutlineMarks(pdfID int64, entries []models.OutlineEntry) 
 			parentID = stack[len(stack)-1]
 		}
 
-		res, err := tx.Exec(`INSERT INTO page_marks (pdf_id, page_num, title, level, is_outline, parent_id, sort_order)
+		res, err := executor.Exec(`INSERT INTO page_marks (pdf_id, page_num, title, level, is_outline, parent_id, sort_order)
 			VALUES (?, ?, ?, ?, 1, ?, ?)`,
 			pdfID, e.Page, e.Title, level, parentID, float64(i+1))
 		if err != nil {
-			tx.Rollback()
 			return err
 		}
 
 		id, err := res.LastInsertId()
 		if err != nil {
-			tx.Rollback()
 			return err
 		}
 		stack = append(stack, id)
 	}
-	return tx.Commit()
+	return nil
 }

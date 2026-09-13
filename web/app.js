@@ -17,6 +17,7 @@ let isSearchMode = false;  // 是否处于搜索模式
 let currentPDF = null;       // 当前 PDF 在数据库中的 ID
 let currentPDFKey = null;    // 当前 PDF 的 cache_key（路径哈希，用于 URL 路由）
 let currentPDFFolder = '';   // 当前 PDF 所在的文件夹路径（用于返回按钮导航）
+let currentOutlineSource = '';// 当前目录来源（goodnotes 或 PDF）
 let currentPage = 1;         // 当前页码
 let pageCount = 0;           // 当前 PDF 总页数
 let requestID = 0;           // 请求计数器，用于丢弃过时的页面加载请求
@@ -248,6 +249,9 @@ function getFolderContents(folder) {
  */
 function renderCacheInfo(pdf) {
     const metaParts = [`${pdf.page_count} 页`, formatSize(pdf.file_size)];
+    if (pdf.outline_source === 'goodnotes') {
+        metaParts.push('<span class="outline-badge">GoodNotes 目录</span>');
+    }
     let cacheBar = '';
     if (pdf.pinned) {
         if (pdf.cached_pages >= pdf.page_count && pdf.page_count > 0) {
@@ -494,6 +498,7 @@ function showReader(key, page) {
     if (!pdf) { showToast('PDF not found'); location.hash = '#/'; return; }
     currentPDF = pdf.id;
     currentPDFKey = key;
+    currentOutlineSource = pdf.outline_source || '';
     // 计算 PDF 所在文件夹路径（用于返回按钮导航）
     currentPDFFolder = pdf.relative_path.includes('/') ? pdf.relative_path.slice(0, pdf.relative_path.lastIndexOf('/')) : '';
     pageCount = pdf.page_count;
@@ -1082,7 +1087,8 @@ function renderMarks(marks) {
     currentMarks = marks;
     const list = $('marks-list');
     if (marks.length === 0) {
-        list.innerHTML = '<div class="marks-empty">暂无目录或标记<br>可在下方添加</div>';
+        const emptyText = currentOutlineSource === 'goodnotes' ? 'GoodNotes 中暂无目录' : '暂无目录或标记<br>可在下方添加';
+        list.innerHTML = `<div class="marks-empty">${emptyText}</div>`;
         return;
     }
 
@@ -1099,7 +1105,10 @@ function renderMarks(marks) {
     }
 
     // 递归渲染树节点
-    let html = '';
+    const hasOutline = marks.some(mark => mark.is_outline);
+    let html = hasOutline
+        ? `<div class="marks-section">${currentOutlineSource === 'goodnotes' ? 'GoodNotes 目录' : 'PDF 目录'}</div>`
+        : '';
     function renderNode(m, level) {
         const children = childrenMap.get(m.id) || [];
         const hasChildren = children.length > 0;

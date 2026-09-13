@@ -157,16 +157,24 @@ func (s *Server) relativePath(absPath string) string {
 }
 
 type pdfListItem struct {
-	ID           int64  `json:"id"`
-	CacheKey     string `json:"cache_key"`
-	Title        string `json:"title"`
-	RelativePath string `json:"relative_path"`
-	PageCount    int    `json:"page_count"`
-	FileSize     int64  `json:"file_size"`
-	Pinned       bool   `json:"pinned"`
-	CachedPages  int    `json:"cached_pages"`
-	CacheActive  bool   `json:"cache_active"`
-	CacheSize    int64  `json:"cache_size_mb"`
+	ID            int64  `json:"id"`
+	CacheKey      string `json:"cache_key"`
+	Title         string `json:"title"`
+	RelativePath  string `json:"relative_path"`
+	PageCount     int    `json:"page_count"`
+	FileSize      int64  `json:"file_size"`
+	Pinned        bool   `json:"pinned"`
+	CachedPages   int    `json:"cached_pages"`
+	CacheActive   bool   `json:"cache_active"`
+	CacheSize     int64  `json:"cache_size_mb"`
+	OutlineSource string `json:"outline_source,omitempty"`
+}
+
+func outlineSource(pdf *models.PDF) string {
+	if pdf.GoodNotesPath != "" {
+		return "goodnotes"
+	}
+	return ""
 }
 
 func (s *Server) handleListPDFs(w http.ResponseWriter, r *http.Request) {
@@ -188,16 +196,17 @@ func (s *Server) handleListPDFs(w http.ResponseWriter, r *http.Request) {
 	items := make([]pdfListItem, 0, len(pdfs))
 	for _, p := range pdfs {
 		items = append(items, pdfListItem{
-			ID:           p.ID,
-			CacheKey:     p.CacheKey,
-			Title:        p.Title,
-			RelativePath: s.relativePath(p.Path),
-			PageCount:    p.PageCount,
-			FileSize:     p.FileSize,
-			Pinned:       p.Pinned,
-			CachedPages:  p.CachedPages,
-			CacheActive:  p.CacheActive,
-			CacheSize:    p.CacheSize / (1024 * 1024),
+			ID:            p.ID,
+			CacheKey:      p.CacheKey,
+			Title:         p.Title,
+			RelativePath:  s.relativePath(p.Path),
+			PageCount:     p.PageCount,
+			FileSize:      p.FileSize,
+			Pinned:        p.Pinned,
+			CachedPages:   p.CachedPages,
+			CacheActive:   p.CacheActive,
+			CacheSize:     p.CacheSize / (1024 * 1024),
+			OutlineSource: outlineSource(p),
 		})
 	}
 	writeJSON(w, 200, items)
@@ -211,16 +220,17 @@ func (s *Server) handleGetPDF(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, pdfListItem{
-		ID:           pdf.ID,
-		CacheKey:     pdf.CacheKey,
-		Title:        pdf.Title,
-		RelativePath: s.relativePath(pdf.Path),
-		PageCount:    pdf.PageCount,
-		FileSize:     pdf.FileSize,
-		Pinned:       pdf.Pinned,
-		CachedPages:  pdf.CachedPages,
-		CacheActive:  pdf.CacheActive,
-		CacheSize:    pdf.CacheSize / (1024 * 1024),
+		ID:            pdf.ID,
+		CacheKey:      pdf.CacheKey,
+		Title:         pdf.Title,
+		RelativePath:  s.relativePath(pdf.Path),
+		PageCount:     pdf.PageCount,
+		FileSize:      pdf.FileSize,
+		Pinned:        pdf.Pinned,
+		CachedPages:   pdf.CachedPages,
+		CacheActive:   pdf.CacheActive,
+		CacheSize:     pdf.CacheSize / (1024 * 1024),
+		OutlineSource: outlineSource(pdf),
 	})
 }
 
@@ -363,7 +373,7 @@ func (s *Server) handleListMarks(w http.ResponseWriter, r *http.Request) {
 	}
 
 	hasOutline, _ := s.db.HasOutlineMarks(pdf.ID)
-	if !hasOutline && renderer.HasMutool() {
+	if pdf.GoodNotesPath == "" && !hasOutline && renderer.HasMutool() {
 		s.extractOutline(pdf)
 	}
 

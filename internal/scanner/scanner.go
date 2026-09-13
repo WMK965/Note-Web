@@ -7,11 +7,13 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
 	"note-web/internal/config"
 	"note-web/internal/db"
+	"note-web/internal/goodnotes"
 	"note-web/internal/renderer"
 	"note-web/internal/util"
 )
@@ -50,6 +52,8 @@ func (s *Scanner) Scan() error {
 	log.Printf("scanning %d directories for PDFs", len(s.dirs))
 
 	foundPaths := make(map[string]bool)
+	pdfFiles := make(map[string]scannedFile)
+	goodNotesFiles := make(map[string]scannedFile)
 
 	// 遍历每个配置目录
 	for _, dir := range s.dirs {
@@ -65,7 +69,8 @@ func (s *Scanner) Scan() error {
 			if d.Type()&os.ModeSymlink != 0 {
 				return nil
 			}
-			if !strings.EqualFold(filepath.Ext(path), ".pdf") {
+			extension := filepath.Ext(path)
+			if !strings.EqualFold(extension, ".pdf") && !strings.EqualFold(extension, ".goodnotes") {
 				return nil
 			}
 
@@ -78,12 +83,33 @@ func (s *Scanner) Scan() error {
 				return nil
 			}
 
-			foundPaths[path] = true
-			s.processPDF(path, info)
+			file := scannedFile{path: path, info: info}
+			key := companionKey(path)
+			if strings.EqualFold(extension, ".pdf") {
+				foundPaths[path] = true
+				pdfFiles[key] = file
+			} else {
+				goodNotesFiles[key] = file
+			}
 			return nil
 		})
 		if err != nil {
 			log.Printf("scan failed for dir %s: %v", dir, err)
+		}
+	}
+
+	keys := make([]string, 0, len(pdfFiles))
+	for key := range pdfFiles {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		pdf := pdfFiles[key]
+		companion, hasCompanion := goodNotesFiles[key]
+		if hasCompanion {
+			s.processPDF(pdf.path, pdf.info, &companion)
+		} else {
+			s.processPDF(pdf.path, pdf.info, nil)
 		}
 	}
 
@@ -97,48 +123,100 @@ func (s *Scanner) Scan() error {
 	return nil
 }
 
+type scannedFile struct {
+	path string
+	info os.FileInfo
+}
+
+func companionKey(path string) string {
+	extension := filepath.Ext(path)
+	return strings.ToLower(filepath.Clean(strings.TrimSuffix(path, extension)))
+}
+
 // processPDF 处理单个 PDF 文件
 // 如果文件是新的或已变更（mtime/size 不同），获取其页数和标题并写入数据库
 // 如果未 pinned 的 PDF 发生变更，清除旧缓存，避免继续显示旧页面。
-func (s *Scanner) processPDF(path string, info os.FileInfo) {
+func (s *Scanner) processPDF(path string, info os.FileInfo, companion *scannedFile) {
 	mtime := info.ModTime().Unix()
 
-	// 检查数据库中是否已有此文件且未变更
+	// PDF 和同名 GoodNotes 任意一个变化时都要继续处理。
 	existing, err := s.db.GetPDFByPath(path)
-	if err == nil && existing != nil && !existing.Deleted {
-		// mtime 和 size 都没变，跳过
-		if existing.FileMtime == mtime && existing.FileSize == info.Size() {
+	pdfChanged := err != nil || existing == nil || existing.Deleted || existing.FileMtime != mtime || existing.FileSize != info.Size()
+	goodNotesChanged := false
+	if companion != nil {
+		goodNotesChanged = existing == nil || existing.GoodNotesPath != companion.path ||
+			existing.GoodNotesMtime != companion.info.ModTime().UnixNano() || existing.GoodNotesSize != companion.info.Size()
+	} else if existing != nil {
+		goodNotesChanged = existing.GoodNotesPath != ""
+	}
+	if !pdfChanged && !goodNotesChanged {
+		return
+	}
+
+	id := int64(0)
+	pageCount := 0
+	title := ""
+	if pdfChanged {
+		// 调用 pdfinfo 或 rsc.io/pdf 获取页数和标题
+		pdfInfo, infoErr := s.renderer.GetPDFInfo(path)
+		if infoErr != nil {
+			log.Printf("failed to get info for %s: %v", path, infoErr)
 			return
 		}
-	}
+		pageCount = pdfInfo.PageCount
+		title = pdfInfo.Title
 
-	// 调用 pdfinfo 或 rsc.io/pdf 获取页数和标题
-	pdfInfo, err := s.renderer.GetPDFInfo(path)
-	if err != nil {
-		log.Printf("failed to get info for %s: %v", path, err)
-		return
-	}
-
-	// 写入数据库，同时计算并存储 cache_key（路径的SHA256哈希前16位）
-	id, err := s.db.AddPDF(path, pdfInfo.Title, util.CacheKey(path), pdfInfo.PageCount, info.Size(), mtime)
-	if err != nil {
-		log.Printf("failed to add/update PDF %s: %v", path, err)
-		return
+		// 写入数据库，同时计算并存储 cache_key（路径的SHA256哈希前16位）
+		id, err = s.db.AddPDF(path, title, util.CacheKey(path), pageCount, info.Size(), mtime)
+		if err != nil {
+			log.Printf("failed to add/update PDF %s: %v", path, err)
+			return
+		}
+	} else {
+		id = existing.ID
+		pageCount = existing.PageCount
+		title = existing.Title
 	}
 
 	// 日志输出（L5: 清理标题中的换行和ANSI转义序列）
-	safeTitle := strings.ReplaceAll(pdfInfo.Title, "\n", " ")
+	safeTitle := strings.ReplaceAll(title, "\n", " ")
 	safeTitle = strings.ReplaceAll(safeTitle, "\r", "")
 
-	if existing != nil && (existing.FileMtime != mtime || existing.FileSize != info.Size()) {
-		// 文件内容变了，PDF 自带目录也可能变了：清除旧目录项，下次打开时重新提取
-		if err := s.db.DeleteOutlineMarks(existing.ID); err != nil {
-			log.Printf("failed to reset outline for updated PDF %d: %v", existing.ID, err)
+	if companion != nil {
+		entries, parseErr := goodnotes.ParseFile(companion.path)
+		if parseErr != nil {
+			// 自动备份可能正在写入；保留上一次成功结果并在下轮扫描重试。
+			log.Printf("failed to parse GoodNotes outline for %s: %v", companion.path, parseErr)
+		} else {
+			for i := range entries {
+				if entries[i].Page > pageCount {
+					entries[i].Page = 0
+				}
+			}
+			if err := s.db.ReplaceOutlineMarksFromGoodNotes(id, entries, companion.path, companion.info.Size(), companion.info.ModTime().UnixNano()); err != nil {
+				log.Printf("failed to store GoodNotes outline for PDF %d: %v", id, err)
+			} else {
+				log.Printf("loaded %d GoodNotes outline entries for %s", len(entries), safeTitle)
+			}
 		}
+	} else if existing != nil && existing.GoodNotesPath != "" {
+		if err := s.db.DeleteOutlineMarks(id); err != nil {
+			log.Printf("failed to clear removed GoodNotes outline for PDF %d: %v", id, err)
+		} else if err := s.db.UpdateGoodNotesSource(id, "", 0, 0); err != nil {
+			log.Printf("failed to clear GoodNotes source for PDF %d: %v", id, err)
+		}
+	} else if pdfChanged && existing != nil {
+		// 没有 GoodNotes 伴随文件时，PDF 变化会让原 PDF 目录失效。
+		if err := s.db.DeleteOutlineMarks(id); err != nil {
+			log.Printf("failed to reset outline for updated PDF %d: %v", id, err)
+		}
+	}
+
+	if existing != nil && pdfChanged {
 		if existing.Pinned {
 			// pinned PDF 由 watcher 的 debounce 负责触发增量重渲染。
 			log.Printf("pinned PDF changed: %s (id=%d), page count: %d -> %d",
-				path, id, existing.PageCount, pdfInfo.PageCount)
+				path, id, existing.PageCount, pageCount)
 		} else if existing.CachedPages > 0 && s.cache != nil {
 			if err := s.cache.InvalidatePDF(existing.ID); err != nil {
 				log.Printf("failed to invalidate cache for updated PDF %d: %v", existing.ID, err)
@@ -148,10 +226,10 @@ func (s *Scanner) processPDF(path string, info os.FileInfo) {
 		}
 	}
 
-	if id > 0 && existing == nil {
-		log.Printf("new PDF: %s (%d pages, %.1fMB)", safeTitle, pdfInfo.PageCount, float64(info.Size())/(1024*1024))
-	} else if existing != nil && existing.FileMtime != mtime {
-		log.Printf("updated PDF: %s (%d pages)", safeTitle, pdfInfo.PageCount)
+	if id > 0 && (existing == nil || existing.Deleted) {
+		log.Printf("new PDF: %s (%d pages, %.1fMB)", safeTitle, pageCount, float64(info.Size())/(1024*1024))
+	} else if existing != nil && pdfChanged {
+		log.Printf("updated PDF: %s (%d pages)", safeTitle, pageCount)
 	}
 }
 

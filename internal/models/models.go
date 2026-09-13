@@ -20,6 +20,9 @@ type PDF struct {
 	CachedPages     int       `json:"cached_pages"`      // 已缓存页面数
 	CacheVersion    int64     `json:"-"`                 // 缓存版本号（每次页面内容变化递增）
 	ChangedPages    string    `json:"-"`                 // 最近一次变化的具体页码（逗号分隔，空表示范围未知）
+	GoodNotesPath   string    `json:"-"`                 // 同目录同名的 GoodNotes 归档路径
+	GoodNotesSize   int64     `json:"-"`                 // GoodNotes 归档大小（用于变化检测）
+	GoodNotesMtime  int64     `json:"-"`                 // GoodNotes 归档修改时间（用于变化检测）
 	CacheLastAccess time.Time `json:"cache_last_access"` // 最后访问时间（用于LRU淘汰）
 	Deleted         bool      `json:"-"`                 // 是否已标记删除（不返回给前端）
 	CreatedAt       time.Time `json:"created_at"`        // 记录创建时间

@@ -219,3 +219,19 @@ func TestPageImageRevalidation(t *testing.T) {
 		t.Errorf("变化后 status = %d body = %q, want 200 与新内容", resp.StatusCode, body)
 	}
 }
+
+func TestPDFResponseReportsGoodNotesOutline(t *testing.T) {
+	env := newTestEnv(t, "")
+	key, id := env.addCachedPDF(t, "book.pdf", 2)
+	if err := env.db.UpdateGoodNotesSource(id, filepath.Join(env.cfg.PDF.Dirs[0], "book.goodnotes"), 123, 456); err != nil {
+		t.Fatal(err)
+	}
+
+	resp, body := env.get(t, "/api/pdfs/"+key, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if !strings.Contains(body, `"outline_source":"goodnotes"`) {
+		t.Fatalf("response does not report GoodNotes outline: %s", body)
+	}
+}

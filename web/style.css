@@ -148,6 +148,16 @@ html, body {
     font-size: 11px;
     margin-left: 6px;
 }
+.outline-badge {
+    display: inline-block;
+    padding: 1px 6px;
+    background: var(--surface-active);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    font-size: 11px;
+    margin-left: 6px;
+}
 .pdf-cache-bar {
     height: 3px; background: var(--border); border-radius: 2px;
     margin-top: 6px; overflow: hidden;
