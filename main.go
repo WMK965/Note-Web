@@ -49,7 +49,7 @@ func main() {
 
 	// 创建缓存目录和数据库目录（如果不存在）
 	log.Printf("initializing database at %s", cfg.Database.Path)
-	os.MkdirAll(cfg.CacheDir, 0755)
+	os.MkdirAll(cfg.Cache.Dir, 0755)
 	os.MkdirAll(filepath.Dir(cfg.Database.Path), 0755)
 
 	// 初始化 SQLite 数据库（使用 WAL 模式提高并发性能）
@@ -60,13 +60,13 @@ func main() {
 	defer database.Close()
 
 	// 创建 PDF 渲染器（封装 pdftoppm 和 pdfinfo 命令）
-	r := renderer.New(cfg.Render)
+	r := renderer.New(cfg.Cache.Render)
 
 	// 创建缓存管理器（管理主动缓存和被动缓存两级缓存）
 	cm := cache.New(database, r, cfg)
 
 	// 创建目录扫描器（递归扫描配置目录，自动发现PDF文件）
-	s := scanner.New(database, r, cfg.PDF, cfg.Database, cm)
+	s := scanner.New(database, r, cfg.Documents, cfg.Database, cm)
 	if err := s.Scan(); err != nil { // 启动时立即执行一次完整扫描
 		log.Printf("initial scan failed: %v", err)
 	}
@@ -86,7 +86,7 @@ func main() {
 	}
 
 	// 创建文件监视器（监视已标记缓存的PDF文件变化，1小时无更新后触发缓存重建）
-	w := watcher.New(database, cm, cfg.ActiveCache)
+	w := watcher.New(database, cm, cfg.Cache.Active)
 	w.Start()
 
 	// 启动 HTTP API 服务器（同时提供前端静态文件服务）

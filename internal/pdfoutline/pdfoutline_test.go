@@ -72,6 +72,21 @@ func TestParseRejectsNonPDF(t *testing.T) {
 	}
 }
 
+// 体积上限可由调用方指定：超过上限直接拒绝，避免超大附件把内存吃满
+func TestParseWithOptionsHonoursMaxFileSize(t *testing.T) {
+	data := syntheticPDF()
+	if _, err := ParseWithOptions(data, Options{MaxFileSize: int64(len(data))}); err != nil {
+		t.Fatalf("上限等于文件大小时不应报错: %v", err)
+	}
+	if _, err := ParseWithOptions(data, Options{MaxFileSize: int64(len(data) - 1)}); err == nil {
+		t.Error("超过上限时应当报错")
+	}
+	// 0 表示使用默认上限
+	if entries, err := ParseWithOptions(data, Options{}); err != nil || len(entries) == 0 {
+		t.Errorf("默认上限应当能正常解析: entries=%d err=%v", len(entries), err)
+	}
+}
+
 // 合法但没有 /Outlines 的 PDF 应当返回空结果而不是错误
 func TestParsePDFWithoutOutline(t *testing.T) {
 	data := []byte(`%PDF-1.4
@@ -91,6 +106,66 @@ trailer
 	entries, err := Parse(data)
 	if err != nil || len(entries) != 0 {
 		t.Errorf("无目录 PDF = %v (err=%v), 期望空结果且无错误", entries, err)
+	}
+}
+
+// /A 是间接引用（形如 /A 9 0 R）时，动作字典在别的对象里，也必须能解出页码
+func TestParseOutlineWithIndirectAction(t *testing.T) {
+	data := []byte(`%PDF-1.7
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R /Outlines 5 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R >>
+endobj
+4 0 obj
+<< /Type /Page /Parent 2 0 R >>
+endobj
+5 0 obj
+<< /Type /Outlines /First 6 0 R /Last 8 0 R /Count 3 >>
+endobj
+6 0 obj
+<< /Title (Chapter 1) /Parent 5 0 R /Next 8 0 R /First 7 0 R /A 9 0 R >>
+endobj
+7 0 obj
+<< /Title (Section 1.1) /Parent 6 0 R /A 10 0 R >>
+endobj
+8 0 obj
+<< /Title (Chapter 2) /Parent 5 0 R /Dest [4 0 R /Fit] >>
+endobj
+9 0 obj
+<< /S /GoTo /D [3 0 R /XYZ 0 792 0] >>
+endobj
+10 0 obj
+<< /S /GoTo /D [4 0 R /Fit] >>
+endobj
+trailer
+<< /Root 1 0 R /Size 11 >>
+%%EOF
+`)
+	entries, err := Parse(data)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	want := []struct {
+		level int
+		page  int
+		title string
+	}{
+		{0, 1, "Chapter 1"},
+		{1, 2, "Section 1.1"},
+		{0, 2, "Chapter 2"},
+	}
+	if len(entries) != len(want) {
+		t.Fatalf("条目数 = %d, 期望 %d: %+v", len(entries), len(want), entries)
+	}
+	for i, w := range want {
+		if entries[i].Level != w.level || entries[i].Page != w.page || entries[i].Title != w.title {
+			t.Errorf("第 %d 条 = %+v, 期望 level=%d page=%d title=%q", i, entries[i], w.level, w.page, w.title)
+		}
 	}
 }
 

@@ -31,14 +31,14 @@ func newTestEnv(t *testing.T, basePath string) *testEnv {
 	dir := t.TempDir()
 
 	cfg := config.Default()
-	cfg.Proxy.BasePath = basePath
+	cfg.Server.ProxyPath = basePath
 	cfg.Database.Path = filepath.Join(dir, "note-web.db")
-	cfg.CacheDir = filepath.Join(dir, "cache")
-	cfg.PDF.Dirs = []string{filepath.Join(dir, "documents")}
+	cfg.Cache.Dir = filepath.Join(dir, "cache")
+	cfg.Documents.Dirs = []string{filepath.Join(dir, "documents")}
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("config invalid: %v", err)
 	}
-	if err := os.MkdirAll(cfg.PDF.Dirs[0], 0755); err != nil {
+	if err := os.MkdirAll(cfg.Documents.Dirs[0], 0755); err != nil {
 		t.Fatalf("mkdir documents: %v", err)
 	}
 
@@ -48,7 +48,7 @@ func newTestEnv(t *testing.T, basePath string) *testEnv {
 	}
 	t.Cleanup(func() { database.Close() })
 
-	r := renderer.New(cfg.Render)
+	r := renderer.New(cfg.Cache.Render)
 	cm := cache.New(database, r, cfg)
 	t.Cleanup(cm.Stop)
 
@@ -92,7 +92,7 @@ func (e *testEnv) get(t *testing.T, path string, headers map[string]string) (*ht
 // addCachedPDF 写入一条 PDF 记录（不渲染），返回 cache_key
 func (e *testEnv) addCachedPDF(t *testing.T, name string, pageCount int) (string, int64) {
 	t.Helper()
-	pdfPath := filepath.Join(e.cfg.PDF.Dirs[0], name)
+	pdfPath := filepath.Join(e.cfg.Documents.Dirs[0], name)
 	if err := os.WriteFile(pdfPath, []byte("%PDF-1.4 minimal"), 0644); err != nil {
 		t.Fatalf("write pdf: %v", err)
 	}
@@ -110,7 +110,7 @@ func (e *testEnv) addCachedPDF(t *testing.T, name string, pageCount int) (string
 
 func (e *testEnv) writePage(t *testing.T, key string, page int, content string) string {
 	t.Helper()
-	path := filepath.Join(e.cfg.CacheDir, key, "p0001.jpg")
+	path := filepath.Join(e.cfg.Cache.Dir, key, "p0001.jpg")
 	if page != 1 {
 		t.Fatalf("test helper only supports page 1")
 	}
@@ -226,7 +226,7 @@ func TestPageImageRevalidation(t *testing.T) {
 func TestPDFResponseReportsGoodNotesOutline(t *testing.T) {
 	env := newTestEnv(t, "")
 	key, id := env.addCachedPDF(t, "book.pdf", 2)
-	if err := env.db.SetOutlineSource(id, filepath.Join(env.cfg.PDF.Dirs[0], "book.goodnotes"), 123, 456, "goodnotes"); err != nil {
+	if err := env.db.SetOutlineSource(id, filepath.Join(env.cfg.Documents.Dirs[0], "book.goodnotes"), 123, 456, "goodnotes"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -243,7 +243,7 @@ func TestPDFResponseReportsGoodNotesOutline(t *testing.T) {
 func TestPDFResponseReportsPDFOutlineSource(t *testing.T) {
 	env := newTestEnv(t, "")
 	key, id := env.addCachedPDF(t, "book.pdf", 2)
-	if err := env.db.SetOutlineSource(id, filepath.Join(env.cfg.PDF.Dirs[0], "book.goodnotes"), 123, 456, "pdf"); err != nil {
+	if err := env.db.SetOutlineSource(id, filepath.Join(env.cfg.Documents.Dirs[0], "book.goodnotes"), 123, 456, "pdf"); err != nil {
 		t.Fatal(err)
 	}
 

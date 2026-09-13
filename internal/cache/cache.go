@@ -5,10 +5,10 @@
 //
 // 缓存目录结构：
 //
-//	{cache_dir}/{cache_key}/p0001.jpg   <- 第1页的JPEG图片
-//	{cache_dir}/{cache_key}/p0002.jpg   <- 第2页
-//	{cache_dir}/{cache_key}.tmp/        <- 全量渲染时的临时目录
-//	{cache_dir}/{cache_key}.old/        <- 旧缓存（渲染完成后被删除）
+//	<cache.dir>/<cache_key>/p0001.jpg   <- 第1页的JPEG图片
+//	<cache.dir>/<cache_key>/p0002.jpg   <- 第2页
+//	<cache.dir>/<cache_key>.tmp/        <- 全量渲染时的临时目录
+//	<cache.dir>/<cache_key>.old/        <- 旧缓存（渲染完成后被删除）
 //
 // cache_key 是PDF文件绝对路径的SHA256哈希前16位，即使数据库重建也不会冲突
 package cache
@@ -61,10 +61,10 @@ func New(database *db.Database, r pdfRenderer, cfg *config.Config) *Manager {
 	m := &Manager{
 		db:             database,
 		renderer:       r,
-		cacheDir:       cfg.CacheDir,
-		maxPassiveSize: int64(cfg.PassiveCache.MaxSizeMB) * 1024 * 1024,
-		renderSem:      make(chan struct{}, cfg.ActiveCache.RenderConcurrency), // 信号量大小 = 并发渲染数
-		renderQueue:    make(chan int64, 100),                                  // 队列缓冲 100 个渲染任务
+		cacheDir:       cfg.Cache.Dir,
+		maxPassiveSize: int64(cfg.Cache.MaxSizeMB) * 1024 * 1024,
+		renderSem:      make(chan struct{}, cfg.Cache.Active.RenderConcurrency), // 信号量大小 = 并发渲染数
+		renderQueue:    make(chan int64, 100),                                   // 队列缓冲 100 个渲染任务
 		queuedRenders:  make(map[int64]bool),
 		stopCh:         make(chan struct{}),
 	}

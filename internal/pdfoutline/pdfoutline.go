@@ -25,20 +25,36 @@ import (
 )
 
 const (
-	// MaxFileSize 是允许解析的 PDF 体积上限，超过则放弃，避免把超大附件读进内存
-	MaxFileSize = 256 << 20
+	// DefaultMaxFileSize 是默认允许解析的 PDF 体积上限，超过则放弃，
+	// 避免把超大附件读进内存（可由 documents.max_file_size 覆盖）。
+	DefaultMaxFileSize = 1 << 30
 	// MaxEntries 限制目录条目数，防止异常文件造成内存膨胀
 	MaxEntries = 5000
 	maxDepth   = 48
 )
 
+// Options 控制解析行为
+type Options struct {
+	// MaxFileSize 是允许解析的 PDF 体积上限（字节），<=0 时用 DefaultMaxFileSize
+	MaxFileSize int64
+}
+
 // Parse 解析 PDF 自带目录，按阅读顺序返回带层级的条目。
 // 没有目录时返回空切片和 nil 错误。
 func Parse(data []byte) ([]models.OutlineEntry, error) {
+	return ParseWithOptions(data, Options{})
+}
+
+// ParseWithOptions 与 Parse 相同，但可以指定体积上限等参数
+func ParseWithOptions(data []byte, opts Options) ([]models.OutlineEntry, error) {
+	maxSize := opts.MaxFileSize
+	if maxSize <= 0 {
+		maxSize = DefaultMaxFileSize
+	}
 	if len(data) == 0 {
 		return nil, errors.New("empty pdf")
 	}
-	if len(data) > MaxFileSize {
+	if int64(len(data)) > maxSize {
 		return nil, fmt.Errorf("pdf too large: %d bytes", len(data))
 	}
 	if !bytes.HasPrefix(data, []byte("%PDF-")) {
@@ -252,7 +268,7 @@ func usesFlate(filter value) bool {
 
 func inflate(raw []byte) ([]byte, error) {
 	if reader, err := zlib.NewReader(bytes.NewReader(raw)); err == nil {
-		data, readErr := io.ReadAll(io.LimitReader(reader, MaxFileSize))
+		data, readErr := io.ReadAll(io.LimitReader(reader, DefaultMaxFileSize))
 		reader.Close()
 		if readErr == nil && len(data) > 0 {
 			return data, nil
@@ -260,7 +276,7 @@ func inflate(raw []byte) ([]byte, error) {
 	}
 	reader := flate.NewReader(bytes.NewReader(raw))
 	defer reader.Close()
-	return io.ReadAll(io.LimitReader(reader, MaxFileSize))
+	return io.ReadAll(io.LimitReader(reader, DefaultMaxFileSize))
 }
 
 // fetch 返回某个对象的字典，失败返回 nil。

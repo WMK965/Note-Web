@@ -29,6 +29,7 @@ type Scanner struct {
 	interval       time.Duration      // 定时扫描间隔
 	retention      time.Duration      // 文件消失后记录的保留时长（0 表示不保留）
 	vacuumInterval time.Duration      // 自动 VACUUM 的最小间隔
+	maxFileSize    int64              // 允许解析的 PDF 体积上限
 	stopCh         chan struct{}      // 停止信号通道
 
 	lastFound   int  // 上一轮扫描发现的 PDF 数量（用于识别异常骤降）
@@ -42,15 +43,16 @@ type cacheInvalidator interface {
 }
 
 // New 创建扫描器实例
-func New(database *db.Database, r *renderer.Renderer, cfg config.PDFConfig, dbCfg config.DatabaseConfig, cache cacheInvalidator) *Scanner {
+func New(database *db.Database, r *renderer.Renderer, cfg config.DocumentsConfig, dbCfg config.DatabaseConfig, cache cacheInvalidator) *Scanner {
 	return &Scanner{
 		db:             database,
 		renderer:       r,
 		cache:          cache,
 		dirs:           cfg.Dirs,
-		interval:       time.Duration(cfg.ScanInterval) * time.Second,
-		retention:      cfg.RetentionDuration(),
-		vacuumInterval: dbCfg.VacuumDuration(),
+		interval:       cfg.ScanInterval.Value(),
+		retention:      cfg.Retention.Value(),
+		vacuumInterval: dbCfg.VacuumInterval.Value(),
+		maxFileSize:    cfg.MaxFileSize.Value(),
 		stopCh:         make(chan struct{}),
 	}
 }
@@ -240,7 +242,11 @@ func (s *Scanner) processPDF(path string, info os.FileInfo, companion *scannedFi
 
 // applyOutline 解析归档目录并写入数据库，pageCount 用于把越界页码降级为纯标题
 func (s *Scanner) applyOutline(pdfID int64, pageCount int, companionPath string, info os.FileInfo, deepScan bool, title string) error {
-	outline, err := goodnotes.ParseFileWithOptions(companionPath, goodnotes.Options{DeepScan: deepScan})
+	start := time.Now()
+	outline, err := goodnotes.ParseFileWithOptions(companionPath, goodnotes.Options{
+		DeepScan:    deepScan,
+		MaxFileSize: s.maxFileSize,
+	})
 	if err != nil {
 		return err
 	}
@@ -254,9 +260,9 @@ func (s *Scanner) applyOutline(pdfID int64, pageCount int, companionPath string,
 		return err
 	}
 	if len(entries) > 0 {
-		log.Printf("loaded %d %s outline entries for %s", len(entries), outline.Source, title)
+		log.Printf("loaded %d %s outline entries for %s (%.1fs)", len(entries), outline.Source, title, time.Since(start).Seconds())
 	} else {
-		log.Printf("no outline found in %s", companionPath)
+		log.Printf("no outline found in %s (%.1fs)", companionPath, time.Since(start).Seconds())
 	}
 	return nil
 }

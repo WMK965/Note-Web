@@ -18,16 +18,16 @@ import (
 
 // Watcher 监视 pinned PDF 文件的变化
 type Watcher struct {
-	db       *db.Database    // 数据库实例
-	cache    *cache.Manager  // 缓存管理器（用于触发重建）
-	debounce time.Duration   // debounce 等待时间（默认1小时）
-	interval time.Duration   // 轮询间隔（默认30秒）
+	db       *db.Database   // 数据库实例
+	cache    *cache.Manager // 缓存管理器（用于触发重建）
+	debounce time.Duration  // debounce 等待时间（默认1小时）
+	interval time.Duration  // 轮询间隔（默认30秒）
 
 	timers map[int64]*time.Timer // 每个 PDF ID 对应的 debounce 计时器
 	mtimes map[int64]int64       // 每个 PDF ID 上次记录的文件修改时间
 	mu     sync.Mutex            // 保护 timers 和 mtimes
 
-	stopCh chan struct{}         // 停止信号
+	stopCh chan struct{} // 停止信号
 }
 
 // New 创建监视器实例
@@ -35,8 +35,8 @@ func New(database *db.Database, cm *cache.Manager, cfg config.ActiveCacheConfig)
 	return &Watcher{
 		db:       database,
 		cache:    cm,
-		debounce: cfg.DebounceDuration(), // 默认 1h
-		interval: cfg.PollDuration(),     // 默认 30s
+		debounce: cfg.WatchDebounce.Value(), // 默认 1h
+		interval: cfg.PollInterval.Value(),  // 默认 30s
 		timers:   make(map[int64]*time.Timer),
 		mtimes:   make(map[int64]int64),
 		stopCh:   make(chan struct{}),

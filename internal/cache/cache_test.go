@@ -50,10 +50,10 @@ func newEnv(t *testing.T, pageCount int) *env {
 	dir := t.TempDir()
 
 	cfg := config.Default()
-	cfg.CacheDir = filepath.Join(dir, "cache")
+	cfg.Cache.Dir = filepath.Join(dir, "cache")
 	cfg.Database.Path = filepath.Join(dir, "note-web.db")
-	cfg.PDF.Dirs = []string{filepath.Join(dir, "documents")}
-	if err := os.MkdirAll(cfg.PDF.Dirs[0], 0755); err != nil {
+	cfg.Documents.Dirs = []string{filepath.Join(dir, "documents")}
+	if err := os.MkdirAll(cfg.Documents.Dirs[0], 0755); err != nil {
 		t.Fatalf("mkdir documents: %v", err)
 	}
 
@@ -70,7 +70,7 @@ func newEnv(t *testing.T, pageCount int) *env {
 
 	mgr := New(database, fake, cfg)
 
-	pdfPath := filepath.Join(cfg.PDF.Dirs[0], "doc.pdf")
+	pdfPath := filepath.Join(cfg.Documents.Dirs[0], "doc.pdf")
 	if err := os.WriteFile(pdfPath, []byte("%PDF-1.4 minimal"), 0644); err != nil {
 		t.Fatalf("write pdf: %v", err)
 	}
@@ -177,7 +177,7 @@ func TestRenderAllPagesReplacesOnlyChangedPages(t *testing.T) {
 	}
 
 	// 临时目录必须清理干净
-	if _, err := os.Stat(filepath.Join(e.cfg.CacheDir, e.key+".tmp")); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(e.cfg.Cache.Dir, e.key+".tmp")); !os.IsNotExist(err) {
 		t.Error("临时渲染目录未被清理")
 	}
 }
@@ -283,7 +283,7 @@ func TestSweepOrphanCacheDirs(t *testing.T) {
 	liveKey := "0123456789abcdef"
 	orphanKey := "fedcba9876543210"
 	for _, name := range []string{liveKey, orphanKey, orphanKey + ".tmp"} {
-		dir := filepath.Join(e.cfg.CacheDir, name)
+		dir := filepath.Join(e.cfg.Cache.Dir, name)
 		if err := os.MkdirAll(dir, 0755); err != nil {
 			t.Fatalf("mkdir %s: %v", name, err)
 		}
@@ -291,7 +291,7 @@ func TestSweepOrphanCacheDirs(t *testing.T) {
 			t.Fatalf("write %s: %v", name, err)
 		}
 	}
-	unrelated := filepath.Join(e.cfg.CacheDir, "keepme")
+	unrelated := filepath.Join(e.cfg.Cache.Dir, "keepme")
 	if err := os.MkdirAll(unrelated, 0755); err != nil {
 		t.Fatalf("mkdir unrelated: %v", err)
 	}
@@ -306,13 +306,13 @@ func TestSweepOrphanCacheDirs(t *testing.T) {
 	if freed <= 0 {
 		t.Errorf("freed = %d, want a positive byte count", freed)
 	}
-	if _, err := os.Stat(filepath.Join(e.cfg.CacheDir, liveKey)); err != nil {
+	if _, err := os.Stat(filepath.Join(e.cfg.Cache.Dir, liveKey)); err != nil {
 		t.Errorf("live cache dir was removed: %v", err)
 	}
 	if _, err := os.Stat(unrelated); err != nil {
 		t.Errorf("unrelated dir was removed: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(e.cfg.CacheDir, orphanKey)); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(e.cfg.Cache.Dir, orphanKey)); !os.IsNotExist(err) {
 		t.Errorf("orphan cache dir still present: %v", err)
 	}
 }

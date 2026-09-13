@@ -1,46 +1,56 @@
+# Note-Web 配置示例
+#
+# 时间统一写成「数字 + 单位」：s 秒、m 分、h 时、d 天，
+# 支持组合与小数，例如 30s、5m、1h30m、7d、0.5h。
+# 体积支持 K/M/G 后缀（1024 进制）或直接写字节数，例如 512MB、1G、2048。
+
 server:
   host: "0.0.0.0"
   port: 8080
-
-proxy:
-  # Optional. When set, the whole app (frontend + API) is ALSO exposed under
-  # this prefix, e.g. "/proxy-index" -> /proxy-index/ and /proxy-index/api/*,
-  # while / and /api/* keep working as before.
-  # This lets an Nginx reverse proxy publish the app on the public internet
-  # without rewriting paths:
+  # 可选。设置后整个应用（前端 + API）会额外挂载到这个前缀下，
+  # 例如 "/proxy-index" -> /proxy-index/ 与 /proxy-index/api/*，
+  # 同时 / 和 /api/* 照旧可用。便于 Nginx 反向代理在不改写路径的情况下
+  # 把服务发布到公网：
   #   location /proxy-index/ { proxy_pass http://note-web:8080; }
-  #
-  # Alternatively leave this empty and let Nginx strip an arbitrary public
-  # prefix; the frontend derives its API prefix from the browser URL:
+  # 也可以留空，让 Nginx 自行剥掉前缀：
   #   location /notes/ { proxy_pass http://note-web:8080/; }
-  base_path: ""
+  proxy_path: ""
 
-pdf:
+documents:
+  # 文档目录列表（支持多目录），容器里对应只读挂载的 /documents
   dirs:
     - /documents
-  scan_interval: 300
-  # 文件从磁盘消失后，记录与标记仍保留的宽限天数；
-  # 超过该天数的记录会在扫描时被真正删除（含目录/标记与页面缓存）。
-  # 设为 0 表示下一轮扫描立即清理。
-  retention_days: 30
+  # 目录扫描间隔
+  scan_interval: 5m
+  # 文件从磁盘消失后，记录与标记仍保留多久；超过后会在扫描时被真正删除
+  # （含目录/标记与页面缓存）。设为 0 表示下一轮扫描立即清理。
+  retention: 30d
+  # 允许解析的 PDF 体积上限：GoodNotes 导入的 PDF 会原样存进归档，
+  # 深度扫描需要把整份 PDF 读进内存，超过上限的附件会被跳过。
+  max_file_size: 1G
 
-render:
-  jpeg_quality: 80
-  scale_width: 1080
-  thumb_width: 200
-
-active_cache:
-  render_concurrency: 3
-  watch_debounce: 1h
-  poll_interval: 30s
-
-passive_cache:
+cache:
+  # 渲染缓存目录，容器里对应 /data/cache
+  dir: /data/cache
+  # 被动缓存最大占用（MB）
   max_size_mb: 2048
 
-database:
-  path: /data/note-web.db
-  # 自动执行 VACUUM 的最小间隔，用于回收删除记录后的空闲页。
-  # 需要 Go 的 duration 格式（"168h" = 7 天）；解析失败时回退为 7 天。
-  vacuum_interval: 168h
+  # 主动缓存：已标记(pinned)的 PDF 全量预渲染
+  active:
+    render_concurrency: 3
+    # 文件变化后等待多久再重建缓存
+    watch_debounce: 1h
+    # 文件变化轮询间隔
+    poll_interval: 30s
 
-cache_dir: /data/cache
+  # 页面渲染参数
+  render:
+    jpeg_quality: 80
+    scale_width: 1080
+    thumb_width: 200
+
+database:
+  # SQLite 数据库路径，容器里对应 /data/note-web.db
+  path: /data/note-web.db
+  # 自动执行 VACUUM 的最小间隔，用于回收删除记录后的空闲页
+  vacuum_interval: 7d

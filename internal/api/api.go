@@ -70,19 +70,19 @@ func (s *Server) SetOutlineRefresher(refresher outlineRefresher) {
 }
 
 // Handler 构建完整的 HTTP 处理器：路由 + 静态文件 + 安全响应头。
-// 配置了 proxy.base_path 时，同一套路由和静态文件会额外挂载到该前缀下，
+// 配置了 server.proxy_path 时，同一套路由和静态文件会额外挂载到该前缀下，
 // 便于通过公网 Nginx 以 /proxy-index/ 访问，同时保留 / 的日常访问。
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 
 	s.registerRoutes(mux, "")
-	if s.cfg.Proxy.BasePath != "" {
-		s.registerRoutes(mux, s.cfg.Proxy.BasePath)
+	if s.cfg.Server.ProxyPath != "" {
+		s.registerRoutes(mux, s.cfg.Server.ProxyPath)
 	}
 
 	fileServer := http.FileServer(http.FS(s.webFS))
-	if s.cfg.Proxy.BasePath != "" {
-		proxyPath := s.cfg.Proxy.BasePath
+	if s.cfg.Server.ProxyPath != "" {
+		proxyPath := s.cfg.Server.ProxyPath
 		mux.HandleFunc("GET "+proxyPath, func(w http.ResponseWriter, r *http.Request) {
 			http.Redirect(w, r, proxyPath+"/", http.StatusMovedPermanently)
 		})
@@ -158,7 +158,7 @@ func writeError(w http.ResponseWriter, code int, msg string) {
 // relativePath 根据配置的PDF根目录，计算文件的相对路径
 // 不匹配任何根目录时返回 "<unknown>" 防止绝对路径泄漏（M5）
 func (s *Server) relativePath(absPath string) string {
-	for _, dir := range s.cfg.PDF.Dirs {
+	for _, dir := range s.cfg.Documents.Dirs {
 		dir = strings.TrimSuffix(dir, "/")
 		if strings.HasPrefix(absPath, dir+"/") || absPath == dir {
 			rel := strings.TrimPrefix(absPath, dir)
@@ -719,7 +719,7 @@ func (s *Server) handleCacheStats(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 500, "failed to get cache stats")
 		return
 	}
-	maxMB := int64(s.cfg.PassiveCache.MaxSizeMB)
+	maxMB := int64(s.cfg.Cache.MaxSizeMB)
 	writeJSON(w, 200, map[string]interface{}{
 		"total_mb": total / (1024 * 1024),
 		"max_mb":   maxMB,

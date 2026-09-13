@@ -80,21 +80,44 @@ func (d *document) pageNumbers(catalog map[string]value) map[int]int {
 // destinationPage 解析条目的跳转目标，返回目标页的对象号
 func (d *document) destinationPage(item map[string]value) int {
 	if dest, ok := item["Dest"]; ok {
-		if ref := d.destinationRef(dest); ref != 0 {
+		if ref := d.destinationRef(d.resolve(dest)); ref != 0 {
 			return ref
 		}
 	}
-	if action, ok := item["A"]; ok && action.kind == kDict {
-		if s, ok2 := action.dict["S"]; ok2 && s.kind == kName && s.name == "GoTo" {
-			if dest, ok3 := action.dict["D"]; ok3 {
-				return d.destinationRef(dest)
+	// /A 常常是间接引用（形如 /A 123 0 R），先解引用再读动作字典
+	if raw, ok := item["A"]; ok {
+		action := d.resolve(raw)
+		if action.kind == kDict {
+			if s := d.resolve(action.dict["S"]); s.kind == kName && s.name == "GoTo" {
+				if dest, ok2 := action.dict["D"]; ok2 {
+					return d.destinationRef(d.resolve(dest))
+				}
 			}
 		}
 	}
 	return 0
 }
 
+// resolve 把间接引用换成它指向的真实值；不是引用时原样返回
+func (d *document) resolve(v value) value {
+	if v.kind != kRef {
+		return v
+	}
+	sp, ok := d.objs[v.ref]
+	if !ok {
+		return value{}
+	}
+	p := &parser{buf: sp.data[sp.start:sp.end]}
+	p.skipSpace()
+	parsed, err := p.parseValue(0)
+	if err != nil {
+		return value{}
+	}
+	return parsed
+}
+
 func (d *document) destinationRef(dest value) int {
+	dest = d.resolve(dest)
 	switch dest.kind {
 	case kArray:
 		if len(dest.arr) == 0 {
@@ -129,12 +152,12 @@ func (d *document) namedDestination(name string) int {
 	}
 	if dests, ok := d.catalogDict["Dests"]; ok && dests.kind == kDict {
 		if dest, ok2 := dests.dict[name]; ok2 {
-			return d.destinationRef(dest)
+			return d.destinationRef(d.resolve(dest))
 		}
 	}
-	if names, ok := d.catalogDict["Names"]; ok && names.kind == kDict {
+	if names := d.resolve(d.catalogDict["Names"]); names.kind == kDict {
 		if tree, ok2 := names.dict["Dests"]; ok2 {
-			return d.nameTreeLookup(tree, name, 0)
+			return d.nameTreeLookup(d.resolve(tree), name, 0)
 		}
 	}
 	return 0
@@ -154,14 +177,14 @@ func (d *document) nameTreeLookup(node value, name string, depth int) int {
 	if node.kind != kDict {
 		return 0
 	}
-	if pairs, ok := node.dict["Names"]; ok && pairs.kind == kArray {
+	if pairs := d.resolve(node.dict["Names"]); pairs.kind == kArray {
 		for i := 0; i+1 < len(pairs.arr); i += 2 {
 			if decodeText(pairs.arr[i]) == name {
-				return d.destinationRef(pairs.arr[i+1])
+				return d.destinationRef(d.resolve(pairs.arr[i+1]))
 			}
 		}
 	}
-	if kids, ok := node.dict["Kids"]; ok && kids.kind == kArray {
+	if kids := d.resolve(node.dict["Kids"]); kids.kind == kArray {
 		for _, kid := range kids.arr {
 			if page := d.nameTreeLookup(kid, name, depth+1); page != 0 {
 				return page

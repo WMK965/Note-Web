@@ -262,6 +262,27 @@ func TestParseFileWithDeepScanDisabled(t *testing.T) {
 	}
 }
 
+// max_file_size 限制过大附件：超过上限时不读取，视为没有目录
+func TestParseFileHonoursMaxFileSize(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "too-big.goodnotes")
+	pageID := "00000000-0000-0000-0000-000000000001"
+	noteID := adjacentUUID(pageID, 1)
+	notes := protobufDelimited(protobufMessage(protobufString(1, noteID), protobufString(2, "notes/"+noteID)))
+	writeArchive(t, path, map[string][]byte{
+		"index.notes.pb":       notes,
+		"index.events.pb":      pageEnvelope(54, pageID, "a"),
+		"attachments/embedded": syntheticOutlinePDF(),
+	})
+
+	outline, err := ParseFileWithOptions(path, Options{DeepScan: true, MaxFileSize: 16})
+	if err != nil {
+		t.Fatalf("parse archive: %v", err)
+	}
+	if len(outline.Entries) != 0 || outline.Source != "" {
+		t.Errorf("超过上限的附件不应被解析: %+v", outline)
+	}
+}
+
 // syntheticOutlinePDF 构造一个带两级目录的最小 PDF
 func syntheticOutlinePDF() []byte {
 	return []byte(`%PDF-1.4

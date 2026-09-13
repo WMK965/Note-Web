@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"note-web/internal/config"
 	"note-web/internal/db"
@@ -29,6 +30,16 @@ func (f *fakeCache) RemoveCacheDir(cacheKey string) error {
 
 func (f *fakeCache) SweepOrphanCacheDirs(map[string]bool) (int, int64, error) {
 	return 0, 0, nil
+}
+
+// testScanConfig 构造测试用的文档扫描配置：5 分钟扫描一次，体积上限 1G
+func testScanConfig(dir string, retention time.Duration) config.DocumentsConfig {
+	return config.DocumentsConfig{
+		Dirs:         []string{dir},
+		ScanInterval: config.DurationOf(5 * time.Minute),
+		Retention:    config.DurationOf(retention),
+		MaxFileSize:  config.ByteSizeOf(1 << 30),
+	}
 }
 
 // 文件消失后先软删除（宽限期内保留标记），宽限期结束再连同缓存一起清理
@@ -60,7 +71,7 @@ func TestScanSoftDeletesThenPurgesMissingPDF(t *testing.T) {
 	}
 
 	cache := &fakeCache{}
-	cfg := config.PDFConfig{Dirs: []string{dir}, ScanInterval: 300, RetentionDays: 30}
+	cfg := testScanConfig(dir, 30*24*time.Hour)
 	if err := New(database, nil, cfg, config.DatabaseConfig{}, cache).Scan(); err != nil {
 		t.Fatalf("first scan: %v", err)
 	}
@@ -77,7 +88,7 @@ func TestScanSoftDeletesThenPurgesMissingPDF(t *testing.T) {
 	}
 
 	// 宽限期为 0：下一轮扫描直接物理清理
-	immediate := config.PDFConfig{Dirs: []string{dir}, ScanInterval: 300, RetentionDays: 0}
+	immediate := testScanConfig(dir, 0)
 	if err := New(database, nil, immediate, config.DatabaseConfig{}, cache).Scan(); err != nil {
 		t.Fatalf("second scan: %v", err)
 	}
@@ -109,7 +120,7 @@ func TestScanKeepsRecordsWhenDirectoryUnavailable(t *testing.T) {
 		t.Fatalf("add pdf: %v", err)
 	}
 
-	cfg := config.PDFConfig{Dirs: []string{offlineDir}, ScanInterval: 300, RetentionDays: 0}
+	cfg := testScanConfig(offlineDir, 0)
 	if err := New(database, nil, cfg, config.DatabaseConfig{}, nil).Scan(); err != nil {
 		t.Fatalf("scan: %v", err)
 	}
@@ -148,7 +159,7 @@ func TestScanDefersPurgeOnDrasticDrop(t *testing.T) {
 		paths = append(paths, path)
 	}
 
-	cfg := config.PDFConfig{Dirs: []string{dir}, ScanInterval: 300, RetentionDays: 0}
+	cfg := testScanConfig(dir, 0)
 	scanner := New(database, nil, cfg, config.DatabaseConfig{}, nil)
 	if err := scanner.Scan(); err != nil { // 第一轮建立 10 个文件的基线
 		t.Fatalf("baseline scan: %v", err)
@@ -204,7 +215,7 @@ func TestScanImportsMatchingGoodNotesOutline(t *testing.T) {
 
 	goodNotesPath := filepath.Join(dir, "book.goodnotes")
 	writeGoodNotesArchive(t, goodNotesPath)
-	cfg := config.PDFConfig{Dirs: []string{dir}, ScanInterval: 300, RetentionDays: 30}
+	cfg := testScanConfig(dir, 30*24*time.Hour)
 	s := New(database, nil, cfg, config.DatabaseConfig{}, nil)
 	if err := s.Scan(); err != nil {
 		t.Fatalf("scan: %v", err)
@@ -308,7 +319,7 @@ func TestRefreshOutlineRespectsDeepScanPreference(t *testing.T) {
 	}
 	writeImportedArchive(t, filepath.Join(dir, "book.goodnotes"))
 
-	scanner := New(database, nil, config.PDFConfig{Dirs: []string{dir}, ScanInterval: 300, RetentionDays: 30}, config.DatabaseConfig{}, nil)
+	scanner := New(database, nil, testScanConfig(dir, 30*24*time.Hour), config.DatabaseConfig{}, nil)
 	if err := scanner.Scan(); err != nil {
 		t.Fatalf("scan: %v", err)
 	}

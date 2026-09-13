@@ -35,6 +35,8 @@ type Outline struct {
 type Options struct {
 	// DeepScan 为真时，GoodNotes 自己没有目录会退回读取内嵌 PDF 附件的书签
 	DeepScan bool
+	// MaxFileSize 是允许深度扫描的 PDF 附件体积上限（字节），<=0 时用默认值
+	MaxFileSize int64
 }
 
 // ParseFile extracts the current outline entries from a .goodnotes archive.
@@ -85,7 +87,7 @@ func ParseFileWithOptions(path string, opts Options) (Outline, error) {
 	}
 
 	if opts.DeepScan {
-		entries, pdfErr := parseEmbeddedPDFOutline(archive)
+		entries, pdfErr := parseEmbeddedPDFOutline(archive, opts.MaxFileSize)
 		if pdfErr == nil && len(entries) > 0 {
 			return Outline{Entries: entries, Source: SourceDeep}, nil
 		}
@@ -97,7 +99,10 @@ func ParseFileWithOptions(path string, opts Options) (Outline, error) {
 // parseEmbeddedPDFOutline 读取归档里内嵌 PDF 附件的自带目录。
 // 一个笔记本可能有多个附件（图片、贴纸等），这里取体积最大的 PDF——
 // 导入的原文档通常是最大的那个。
-func parseEmbeddedPDFOutline(archive *zip.ReadCloser) ([]models.OutlineEntry, error) {
+func parseEmbeddedPDFOutline(archive *zip.ReadCloser, maxFileSize int64) ([]models.OutlineEntry, error) {
+	if maxFileSize <= 0 {
+		maxFileSize = pdfoutline.DefaultMaxFileSize
+	}
 	var candidate *zip.File
 	for _, file := range archive.File {
 		if !strings.HasPrefix(file.Name, "attachments/") {
@@ -106,7 +111,7 @@ func parseEmbeddedPDFOutline(archive *zip.ReadCloser) ([]models.OutlineEntry, er
 		if file.FileInfo().Mode()&os.ModeSymlink != 0 {
 			continue
 		}
-		if file.UncompressedSize64 == 0 || file.UncompressedSize64 > pdfoutline.MaxFileSize {
+		if file.UncompressedSize64 == 0 || file.UncompressedSize64 > uint64(maxFileSize) {
 			continue
 		}
 		if candidate != nil && file.UncompressedSize64 <= candidate.UncompressedSize64 {
@@ -126,7 +131,7 @@ func parseEmbeddedPDFOutline(archive *zip.ReadCloser) ([]models.OutlineEntry, er
 	if err != nil {
 		return nil, err
 	}
-	data, readErr := io.ReadAll(io.LimitReader(reader, pdfoutline.MaxFileSize+1))
+	data, readErr := io.ReadAll(io.LimitReader(reader, maxFileSize+1))
 	closeErr := reader.Close()
 	if readErr != nil {
 		return nil, readErr
@@ -134,10 +139,10 @@ func parseEmbeddedPDFOutline(archive *zip.ReadCloser) ([]models.OutlineEntry, er
 	if closeErr != nil {
 		return nil, closeErr
 	}
-	if int64(len(data)) > pdfoutline.MaxFileSize {
+	if int64(len(data)) > maxFileSize {
 		return nil, fmt.Errorf("embedded pdf is too large")
 	}
-	return pdfoutline.Parse(data)
+	return pdfoutline.ParseWithOptions(data, pdfoutline.Options{MaxFileSize: maxFileSize})
 }
 
 // hasPDFMagic 通过文件头判断附件是不是 PDF
