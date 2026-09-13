@@ -19,6 +19,7 @@ import (
 
 type testEnv struct {
 	server *httptest.Server
+	api    *Server
 	db     *db.Database
 	cfg    *config.Config
 	client *http.Client
@@ -52,11 +53,13 @@ func newTestEnv(t *testing.T, basePath string) *testEnv {
 	t.Cleanup(cm.Stop)
 
 	webRoot := os.DirFS(filepath.Join("..", "..", "web"))
-	srv := httptest.NewServer(New(database, cm, r, cfg, webRoot).Handler())
+	apiServer := New(database, cm, r, cfg, webRoot)
+	srv := httptest.NewServer(apiServer.Handler())
 	t.Cleanup(srv.Close)
 
 	return &testEnv{
 		server: srv,
+		api:    apiServer,
 		db:     database,
 		cfg:    cfg,
 		client: &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error {
@@ -223,7 +226,7 @@ func TestPageImageRevalidation(t *testing.T) {
 func TestPDFResponseReportsGoodNotesOutline(t *testing.T) {
 	env := newTestEnv(t, "")
 	key, id := env.addCachedPDF(t, "book.pdf", 2)
-	if err := env.db.UpdateGoodNotesSource(id, filepath.Join(env.cfg.PDF.Dirs[0], "book.goodnotes"), 123, 456); err != nil {
+	if err := env.db.SetOutlineSource(id, filepath.Join(env.cfg.PDF.Dirs[0], "book.goodnotes"), 123, 456, "goodnotes"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -233,5 +236,94 @@ func TestPDFResponseReportsGoodNotesOutline(t *testing.T) {
 	}
 	if !strings.Contains(body, `"outline_source":"goodnotes"`) {
 		t.Fatalf("response does not report GoodNotes outline: %s", body)
+	}
+}
+
+// 目录来自归档内嵌 PDF 时，接口要如实报告来源，前端才能显示成 PDF 目录
+func TestPDFResponseReportsPDFOutlineSource(t *testing.T) {
+	env := newTestEnv(t, "")
+	key, id := env.addCachedPDF(t, "book.pdf", 2)
+	if err := env.db.SetOutlineSource(id, filepath.Join(env.cfg.PDF.Dirs[0], "book.goodnotes"), 123, 456, "pdf"); err != nil {
+		t.Fatal(err)
+	}
+
+	resp, body := env.get(t, "/api/pdfs/"+key, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if !strings.Contains(body, `"outline_source":"pdf"`) {
+		t.Fatalf("response does not report PDF outline source: %s", body)
+	}
+}
+
+// fakeRefresher 记录接口层是否触发了目录重算
+type fakeRefresher struct {
+	ids []int64
+	err error
+}
+
+func (f *fakeRefresher) RefreshOutline(pdfID int64) error {
+	f.ids = append(f.ids, pdfID)
+	return f.err
+}
+
+// 深度扫描开关：写入偏好、立即重算目录，并把最新状态返回给前端
+func TestSetDeepScanEndpoint(t *testing.T) {
+	env := newTestEnv(t, "")
+	key, id := env.addCachedPDF(t, "book.pdf", 2)
+	refresher := &fakeRefresher{}
+	env.api.SetOutlineRefresher(refresher)
+
+	req, err := http.NewRequest(http.MethodPut, env.server.URL+"/api/pdfs/"+key+"/deep-scan",
+		strings.NewReader(`{"enabled":false}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := env.client.Do(req)
+	if err != nil {
+		t.Fatalf("PUT deep-scan: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d body = %s", resp.StatusCode, body)
+	}
+	if !strings.Contains(string(body), `"deep_scan":false`) {
+		t.Errorf("response does not report the new state: %s", body)
+	}
+
+	pdf, err := env.db.GetPDF(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pdf.DeepScan != 0 {
+		t.Errorf("stored deep scan mode = %d, want 0", pdf.DeepScan)
+	}
+	if len(refresher.ids) != 1 || refresher.ids[0] != id {
+		t.Errorf("refresher calls = %v, want [%d]", refresher.ids, id)
+	}
+
+	// 再次开启
+	req, err = http.NewRequest(http.MethodPut, env.server.URL+"/api/pdfs/"+key+"/deep-scan",
+		strings.NewReader(`{"enabled":true}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp2, err := env.client.Do(req)
+	if err != nil {
+		t.Fatalf("PUT deep-scan (enable): %v", err)
+	}
+	defer resp2.Body.Close()
+	if resp2.StatusCode != http.StatusOK {
+		t.Fatalf("enable status = %d", resp2.StatusCode)
+	}
+	pdf, err = env.db.GetPDF(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pdf.DeepScan != 1 {
+		t.Errorf("stored deep scan mode = %d, want 1", pdf.DeepScan)
 	}
 }

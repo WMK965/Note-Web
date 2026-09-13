@@ -96,7 +96,7 @@ func TestAddOutlineMarksReplacesPrevious(t *testing.T) {
 	}
 }
 
-func TestReplaceOutlineMarksFromGoodNotesRecordsSource(t *testing.T) {
+func TestReplaceOutlineMarksFromArchiveRecordsSource(t *testing.T) {
 	database := newTestDB(t)
 	id, err := database.AddPDF("/documents/book.pdf", "book", "key-book", 10, 10, 1)
 	if err != nil {
@@ -111,7 +111,7 @@ func TestReplaceOutlineMarksFromGoodNotesRecordsSource(t *testing.T) {
 		{Level: 0, Page: 2, Title: "第一章"},
 		{Level: 1, Page: 3, Title: "第一节"},
 	}
-	if err := database.ReplaceOutlineMarksFromGoodNotes(id, entries, "/documents/book.goodnotes", 123, 456); err != nil {
+	if err := database.ReplaceOutlineMarksFromArchive(id, entries, "/documents/book.goodnotes", 123, 456, "pdf"); err != nil {
 		t.Fatalf("replace GoodNotes outline: %v", err)
 	}
 	pdf, err := database.GetPDF(id)
@@ -120,6 +120,9 @@ func TestReplaceOutlineMarksFromGoodNotesRecordsSource(t *testing.T) {
 	}
 	if pdf.GoodNotesPath != "/documents/book.goodnotes" || pdf.GoodNotesSize != 123 || pdf.GoodNotesMtime != 456 {
 		t.Errorf("GoodNotes source = (%q, %d, %d)", pdf.GoodNotesPath, pdf.GoodNotesSize, pdf.GoodNotesMtime)
+	}
+	if pdf.OutlineOrigin != "pdf" {
+		t.Errorf("outline origin = %q, want %q", pdf.OutlineOrigin, "pdf")
 	}
 	marks, err := database.ListMarks(id)
 	if err != nil {
@@ -367,5 +370,40 @@ func TestMaybeVacuumRespectsInterval(t *testing.T) {
 
 	if done, err = database.MaybeVacuum(0); err != nil || done {
 		t.Errorf("zero interval vacuum = (%v, %v), want (false, nil)", done, err)
+	}
+}
+
+// 深度扫描偏好的默认值与取值校验
+func TestDeepScanPreference(t *testing.T) {
+	database := newTestDB(t)
+	id, err := database.AddPDF("/documents/book.pdf", "book", "key-book", 10, 10, 1)
+	if err != nil {
+		t.Fatalf("add pdf: %v", err)
+	}
+
+	pdf, err := database.GetPDF(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pdf.DeepScan != -1 {
+		t.Errorf("默认 deep_scan = %d, 期望 -1（自动）", pdf.DeepScan)
+	}
+
+	if err := database.SetDeepScan(id, 0); err != nil {
+		t.Fatalf("close deep scan: %v", err)
+	}
+	if pdf, err = database.GetPDF(id); err != nil || pdf.DeepScan != 0 {
+		t.Errorf("关闭后 deep_scan = %+v (err=%v), 期望 0", pdf, err)
+	}
+
+	if err := database.SetDeepScan(id, 1); err != nil {
+		t.Fatalf("open deep scan: %v", err)
+	}
+	if pdf, err = database.GetPDF(id); err != nil || pdf.DeepScan != 1 {
+		t.Errorf("开启后 deep_scan = %+v (err=%v), 期望 1", pdf, err)
+	}
+
+	if err := database.SetDeepScan(id, 7); err == nil {
+		t.Error("非法的 deep_scan 取值应当报错")
 	}
 }

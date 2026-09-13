@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"note-web/internal/models"
+	"note-web/internal/pdfoutline"
 )
 
 const (
@@ -18,41 +19,139 @@ const (
 	maxRecordBytes = 16 << 20
 )
 
+// 目录来源：GoodNotes 自己的书签记录，或深度扫描归档内嵌 PDF 得到的书签
+const (
+	SourceGoodNotes = "goodnotes"
+	SourceDeep      = "deep"
+)
+
+// Outline 是从归档里解析出的目录及其来源
+type Outline struct {
+	Entries []models.OutlineEntry
+	Source  string
+}
+
+// Options 控制归档解析行为
+type Options struct {
+	// DeepScan 为真时，GoodNotes 自己没有目录会退回读取内嵌 PDF 附件的书签
+	DeepScan bool
+}
+
 // ParseFile extracts the current outline entries from a .goodnotes archive.
 // GoodNotes stores the data as a length-delimited protobuf stream. The schema
 // is private, so the parser reads only the stable fields used by the outline
 // records and ignores the rest.
-func ParseFile(path string) ([]models.OutlineEntry, error) {
+//
+// 如果归档里没有 GoodNotes 自己创建的目录，会退回读取内嵌 PDF 附件自带的
+// 书签：导入带目录的 PDF 时，GoodNotes 只把原文件存成附件，不会把目录
+// 复制进自己的事件流。
+func ParseFile(path string) (Outline, error) {
+	return ParseFileWithOptions(path, Options{DeepScan: true})
+}
+
+// ParseFileWithOptions 与 ParseFile 相同，但可以控制是否做目录深度扫描
+func ParseFileWithOptions(path string, opts Options) (Outline, error) {
 	archive, err := zip.OpenReader(path)
 	if err != nil {
-		return nil, fmt.Errorf("open goodnotes archive: %w", err)
+		return Outline{}, fmt.Errorf("open goodnotes archive: %w", err)
 	}
 	defer archive.Close()
 
 	notesData, err := readArchiveFile(archive, "index.notes.pb", maxNotesBytes)
 	if err != nil {
-		return nil, fmt.Errorf("read index.notes.pb: %w", err)
+		return Outline{}, fmt.Errorf("read index.notes.pb: %w", err)
 	}
 	eventsData, err := readArchiveFile(archive, "index.events.pb", maxEventsBytes)
 	if err != nil {
-		return nil, fmt.Errorf("read index.events.pb: %w", err)
+		return Outline{}, fmt.Errorf("read index.events.pb: %w", err)
 	}
 
 	pages, err := parsePages(notesData)
 	if err != nil {
-		return nil, fmt.Errorf("parse index.notes.pb: %w", err)
+		return Outline{}, fmt.Errorf("parse index.notes.pb: %w", err)
 	}
 	if eventPages, pageErr := parseCurrentPages(eventsData); pageErr != nil {
-		return nil, fmt.Errorf("parse GoodNotes page events: %w", pageErr)
+		return Outline{}, fmt.Errorf("parse GoodNotes page events: %w", pageErr)
 	} else if len(eventPages) > 0 {
 		pages = eventPages
 	}
 	records, err := parseOutlineRecords(eventsData)
 	if err != nil {
-		return nil, fmt.Errorf("parse index.events.pb: %w", err)
+		return Outline{}, fmt.Errorf("parse index.events.pb: %w", err)
 	}
 
-	return buildEntries(records, pages), nil
+	if entries := buildEntries(records, pages); len(entries) > 0 {
+		return Outline{Entries: entries, Source: SourceGoodNotes}, nil
+	}
+
+	if opts.DeepScan {
+		entries, pdfErr := parseEmbeddedPDFOutline(archive)
+		if pdfErr == nil && len(entries) > 0 {
+			return Outline{Entries: entries, Source: SourceDeep}, nil
+		}
+	}
+	// 没有内嵌 PDF、它本身没有目录，或关闭了深度扫描，都按“该笔记本没有目录”处理
+	return Outline{}, nil
+}
+
+// parseEmbeddedPDFOutline 读取归档里内嵌 PDF 附件的自带目录。
+// 一个笔记本可能有多个附件（图片、贴纸等），这里取体积最大的 PDF——
+// 导入的原文档通常是最大的那个。
+func parseEmbeddedPDFOutline(archive *zip.ReadCloser) ([]models.OutlineEntry, error) {
+	var candidate *zip.File
+	for _, file := range archive.File {
+		if !strings.HasPrefix(file.Name, "attachments/") {
+			continue
+		}
+		if file.FileInfo().Mode()&os.ModeSymlink != 0 {
+			continue
+		}
+		if file.UncompressedSize64 == 0 || file.UncompressedSize64 > pdfoutline.MaxFileSize {
+			continue
+		}
+		if candidate != nil && file.UncompressedSize64 <= candidate.UncompressedSize64 {
+			continue
+		}
+		ok, err := hasPDFMagic(file)
+		if err != nil || !ok {
+			continue
+		}
+		candidate = file
+	}
+	if candidate == nil {
+		return nil, nil
+	}
+
+	reader, err := candidate.Open()
+	if err != nil {
+		return nil, err
+	}
+	data, readErr := io.ReadAll(io.LimitReader(reader, pdfoutline.MaxFileSize+1))
+	closeErr := reader.Close()
+	if readErr != nil {
+		return nil, readErr
+	}
+	if closeErr != nil {
+		return nil, closeErr
+	}
+	if int64(len(data)) > pdfoutline.MaxFileSize {
+		return nil, fmt.Errorf("embedded pdf is too large")
+	}
+	return pdfoutline.Parse(data)
+}
+
+// hasPDFMagic 通过文件头判断附件是不是 PDF
+func hasPDFMagic(file *zip.File) (bool, error) {
+	reader, err := file.Open()
+	if err != nil {
+		return false, err
+	}
+	defer reader.Close()
+	head := make([]byte, len("%PDF-"))
+	if _, err := io.ReadFull(reader, head); err != nil {
+		return false, err
+	}
+	return string(head) == "%PDF-", nil
 }
 
 func readArchiveFile(archive *zip.ReadCloser, name string, maxSize int64) ([]byte, error) {

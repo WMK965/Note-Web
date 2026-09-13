@@ -11,6 +11,7 @@ package db
 
 import (
 	"database/sql"
+	"fmt"
 	"log"
 	"strconv"
 	"strings"
@@ -60,6 +61,8 @@ func migrate(db *sql.DB) error {
 			goodnotes_path TEXT NOT NULL DEFAULT '',
 			goodnotes_size INTEGER NOT NULL DEFAULT 0,
 			goodnotes_mtime INTEGER NOT NULL DEFAULT 0,
+			outline_origin TEXT NOT NULL DEFAULT '',
+			deep_scan INTEGER NOT NULL DEFAULT -1,
 			deleted INTEGER NOT NULL DEFAULT 0,
 			deleted_at INTEGER,
 			rebuilding INTEGER NOT NULL DEFAULT 0,
@@ -108,6 +111,8 @@ func migrate(db *sql.DB) error {
 		{name: "goodnotes_size", definition: "INTEGER NOT NULL DEFAULT 0"},
 		{name: "goodnotes_mtime", definition: "INTEGER NOT NULL DEFAULT 0"},
 		{name: "deleted_at", definition: "INTEGER"},
+		{name: "outline_origin", definition: "TEXT NOT NULL DEFAULT ''"},
+		{name: "deep_scan", definition: "INTEGER NOT NULL DEFAULT -1"},
 	} {
 		db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('pdfs') WHERE name = ?`, column.name).Scan(&colCount)
 		if colCount == 0 {
@@ -179,7 +184,7 @@ func migrate(db *sql.DB) error {
 		if _, err := db.Exec(`DELETE FROM page_marks WHERE is_outline = 1`); err != nil {
 			log.Printf("migration: failed to drop stale outline marks: %v", err)
 		}
-		if _, err := db.Exec(`UPDATE pdfs SET goodnotes_path = '', goodnotes_size = 0, goodnotes_mtime = 0`); err != nil {
+		if _, err := db.Exec(`UPDATE pdfs SET goodnotes_path = '', goodnotes_size = 0, goodnotes_mtime = 0, outline_origin = ''`); err != nil {
 			log.Printf("migration: failed to reset GoodNotes source state: %v", err)
 		}
 		if _, err := db.Exec(`INSERT INTO meta (key, value) VALUES (?, ?)
@@ -262,7 +267,7 @@ func rebuildMarksWithCascade(db *sql.DB) error {
 // 目录解析逻辑的版本号，变更解析方式时递增即可让旧数据重新提取
 const (
 	keyOutlineParser     = "outline_parser"
-	outlineParserVersion = "4"
+	outlineParserVersion = "5"
 	keyLastVacuum        = "last_vacuum"
 )
 
@@ -270,7 +275,7 @@ const pdfColumns = `id, path, title, cache_key, page_count, file_size, file_mtim
 		       pinned, cache_active, cache_size, cached_pages, cache_last_access,
 		       deleted, rebuilding, cache_version, changed_pages,
 		       goodnotes_path, goodnotes_size, goodnotes_mtime, created_at, updated_at,
-		       deleted_at`
+		       deleted_at, outline_origin, deep_scan`
 
 func scanPDF(r interface{ Scan(...interface{}) error }) (*models.PDF, error) {
 	p := &models.PDF{}
@@ -282,7 +287,7 @@ func scanPDF(r interface{ Scan(...interface{}) error }) (*models.PDF, error) {
 		&pinned, &cacheActive, &p.CacheSize, &p.CachedPages, &cacheLastAccess,
 		&deleted, &rebuilding, &p.CacheVersion, &p.ChangedPages,
 		&p.GoodNotesPath, &p.GoodNotesSize, &p.GoodNotesMtime, &p.CreatedAt, &p.UpdatedAt,
-		&deletedAt,
+		&deletedAt, &p.OutlineOrigin, &p.DeepScan,
 	); err != nil {
 		return nil, err
 	}
@@ -386,9 +391,19 @@ func (db *Database) UpdatePDFMetadata(id int64, title string, pageCount int, fil
 	return err
 }
 
-func (db *Database) UpdateGoodNotesSource(id int64, path string, fileSize, fileMtime int64) error {
-	_, err := db.Exec(`UPDATE pdfs SET goodnotes_path = ?, goodnotes_size = ?, goodnotes_mtime = ?, updated_at = ? WHERE id = ?`,
-		path, fileSize, fileMtime, time.Now(), id)
+// SetOutlineSource 记录目录来源（goodnotes / pdf / 空）以及归档签名
+func (db *Database) SetOutlineSource(id int64, path string, fileSize, fileMtime int64, origin string) error {
+	_, err := db.Exec(`UPDATE pdfs SET goodnotes_path = ?, goodnotes_size = ?, goodnotes_mtime = ?, outline_origin = ?, updated_at = ? WHERE id = ?`,
+		path, fileSize, fileMtime, origin, time.Now(), id)
+	return err
+}
+
+// SetDeepScan 记录某个 PDF 的目录深度扫描偏好：1 开启、0 关闭、-1 自动
+func (db *Database) SetDeepScan(id int64, mode int) error {
+	if mode < -1 || mode > 1 {
+		return fmt.Errorf("invalid deep scan mode: %d", mode)
+	}
+	_, err := db.Exec(`UPDATE pdfs SET deep_scan = ?, updated_at = ? WHERE id = ?`, mode, time.Now(), id)
 	return err
 }
 
@@ -812,9 +827,9 @@ func (db *Database) AddOutlineMarks(pdfID int64, entries []models.OutlineEntry) 
 	return tx.Commit()
 }
 
-// ReplaceOutlineMarksFromGoodNotes atomically replaces generated outline marks
-// and records the archive signature that produced them.
-func (db *Database) ReplaceOutlineMarksFromGoodNotes(pdfID int64, entries []models.OutlineEntry, path string, fileSize, fileMtime int64) error {
+// ReplaceOutlineMarksFromArchive 原子地替换自动生成的目录项，
+// 并记录归档签名（路径/大小/修改时间）与目录来源（goodnotes 或 pdf）。
+func (db *Database) ReplaceOutlineMarksFromArchive(pdfID int64, entries []models.OutlineEntry, path string, fileSize, fileMtime int64, origin string) error {
 	tx, err := db.Begin()
 	if err != nil {
 		return err
@@ -831,8 +846,8 @@ func (db *Database) ReplaceOutlineMarksFromGoodNotes(pdfID int64, entries []mode
 		tx.Rollback()
 		return err
 	}
-	if _, err := tx.Exec(`UPDATE pdfs SET goodnotes_path = ?, goodnotes_size = ?, goodnotes_mtime = ?, updated_at = ? WHERE id = ?`,
-		path, fileSize, fileMtime, time.Now(), pdfID); err != nil {
+	if _, err := tx.Exec(`UPDATE pdfs SET goodnotes_path = ?, goodnotes_size = ?, goodnotes_mtime = ?, outline_origin = ?, updated_at = ? WHERE id = ?`,
+		path, fileSize, fileMtime, origin, time.Now(), pdfID); err != nil {
 		tx.Rollback()
 		return err
 	}

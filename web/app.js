@@ -251,6 +251,10 @@ function renderCacheInfo(pdf) {
     const metaParts = [`${pdf.page_count} 页`, formatSize(pdf.file_size)];
     if (pdf.outline_source === 'goodnotes') {
         metaParts.push('<span class="outline-badge">GoodNotes 目录</span>');
+    } else if (pdf.outline_source === 'deep') {
+        metaParts.push('<span class="outline-badge">深度扫描</span>');
+    } else if (pdf.outline_source === 'pdf') {
+        metaParts.push('<span class="outline-badge">PDF 目录</span>');
     }
     let cacheBar = '';
     if (pdf.pinned) {
@@ -499,6 +503,7 @@ function showReader(key, page) {
     currentPDF = pdf.id;
     currentPDFKey = key;
     currentOutlineSource = pdf.outline_source || '';
+    $('deep-scan-input').checked = pdf.deep_scan !== false;
     // 计算 PDF 所在文件夹路径（用于返回按钮导航）
     currentPDFFolder = pdf.relative_path.includes('/') ? pdf.relative_path.slice(0, pdf.relative_path.lastIndexOf('/')) : '';
     pageCount = pdf.page_count;
@@ -1042,6 +1047,7 @@ document.addEventListener('mouseup', () => {
 // ===== 目录与标记侧边栏 =====
 
 let collapsedMarks = new Set(); // 已折叠的标记ID集合
+let collapsedGroups = new Set(); // 已折叠的来源分组（user / outline:来源）
 let currentMarks = [];          // 当前标记列表（从后端加载）
 
 /** 打开侧边栏 */
@@ -1087,7 +1093,14 @@ function renderMarks(marks) {
     currentMarks = marks;
     const list = $('marks-list');
     if (marks.length === 0) {
-        const emptyText = currentOutlineSource === 'goodnotes' ? 'GoodNotes 中暂无目录' : '暂无目录或标记<br>可在下方添加';
+        let emptyText = '暂无目录或标记<br>可在下方添加';
+        if (currentOutlineSource === 'goodnotes') {
+            emptyText = 'GoodNotes 中暂无目录';
+        } else if (currentOutlineSource === 'deep') {
+            emptyText = '深度扫描未找到目录';
+        } else if (currentOutlineSource === 'pdf') {
+            emptyText = '该 PDF 中暂无目录';
+        }
         list.innerHTML = `<div class="marks-empty">${emptyText}</div>`;
         return;
     }
@@ -1104,11 +1117,35 @@ function renderMarks(marks) {
         }
     }
 
+    // 按来源分组：我的标记 / GoodNotes 目录 / 深度扫描 / PDF 目录。
+    // 每组标题可点击折叠，避免目录项和用户标记混在一起难以分辨。
+    const outlineRoots = roots.filter(m => m.is_outline);
+    const userRoots = roots.filter(m => !m.is_outline);
+    const hasOutline = outlineRoots.length > 0;
+    const outlineGroupKey = 'outline:' + (currentOutlineSource || 'pdf');
+    let outlineLabel = 'PDF 目录';
+    if (currentOutlineSource === 'goodnotes') outlineLabel = 'GoodNotes 目录';
+    else if (currentOutlineSource === 'deep') outlineLabel = '深度扫描';
+
+    const groups = [];
+    if (userRoots.length > 0) groups.push({ key: 'user', label: '我的标记', roots: userRoots });
+    if (hasOutline) groups.push({ key: outlineGroupKey, label: outlineLabel, roots: outlineRoots });
+
+    // 统计每组的节点数（含子项），显示在标题右侧
+    function countNodes(nodes) {
+        let total = 0;
+        const stack = [...nodes];
+        while (stack.length > 0) {
+            const node = stack.pop();
+            total++;
+            const children = childrenMap.get(node.id) || [];
+            for (const child of children) stack.push(child);
+        }
+        return total;
+    }
+
+    let html = '';
     // 递归渲染树节点
-    const hasOutline = marks.some(mark => mark.is_outline);
-    let html = hasOutline
-        ? `<div class="marks-section">${currentOutlineSource === 'goodnotes' ? 'GoodNotes 目录' : 'PDF 目录'}</div>`
-        : '';
     function renderNode(m, level) {
         const children = childrenMap.get(m.id) || [];
         const hasChildren = children.length > 0;
@@ -1142,7 +1179,17 @@ function renderMarks(marks) {
             for (const child of children) renderNode(child, level + 1);
         }
     }
-    for (const m of roots) renderNode(m, 0);
+    for (const group of groups) {
+        const collapsed = collapsedGroups.has(group.key);
+        html += `<div class="marks-section ${collapsed ? 'collapsed' : ''}" data-group="${group.key}">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg>
+            <span>${group.label}</span>
+            <span class="marks-section-count">${countNodes(group.roots)}</span>
+        </div>`;
+        if (!collapsed) {
+            for (const m of group.roots) renderNode(m, 0);
+        }
+    }
 
     list.innerHTML = html;
     bindMarkEvents(list);
@@ -1150,6 +1197,16 @@ function renderMarks(marks) {
 
 /** 为标记列表绑定事件：点击跳转、展开折叠、删除、拖拽 */
 function bindMarkEvents(list) {
+    // 点击分组标题 -> 折叠/展开该来源下的全部目录
+    list.querySelectorAll('.marks-section[data-group]').forEach(el => {
+        el.addEventListener('click', () => {
+            const group = el.dataset.group;
+            if (collapsedGroups.has(group)) collapsedGroups.delete(group);
+            else collapsedGroups.add(group);
+            renderMarks(currentMarks);
+        });
+    });
+
     // 点击标记项 -> 跳转到对应页面
     list.querySelectorAll('.mark-item').forEach(el => {
         el.addEventListener('click', e => {
@@ -1329,12 +1386,70 @@ $('mark-title-input').addEventListener('keydown', e => {
     if (e.key === 'Enter') $('mark-add-btn').click();
 });
 
-// ===== 批量添加目录 =====
+// ===== 侧栏底部菜单：批量添加目录 / 目录深度扫描 =====
+
+const marksMenu = $('marks-menu');
+
+function closeMarksMenu() {
+    marksMenu.classList.add('hidden');
+    $('batch-add-btn').setAttribute('aria-expanded', 'false');
+}
+
+function openMarksMenu() {
+    marksMenu.classList.remove('hidden');
+    $('batch-add-btn').setAttribute('aria-expanded', 'true');
+}
+
+$('batch-add-btn').addEventListener('click', e => {
+    e.stopPropagation();
+    if (marksMenu.classList.contains('hidden')) openMarksMenu(); else closeMarksMenu();
+});
+
+// 点击菜单以外的区域收起菜单
+document.addEventListener('click', e => {
+    if (!marksMenu.classList.contains('hidden') && !e.target.closest('.marks-menu-wrap')) {
+        closeMarksMenu();
+    }
+});
 
 // 打开批量添加模态窗口
-$('batch-add-btn').addEventListener('click', () => {
+$('menu-batch-add').addEventListener('click', () => {
+    closeMarksMenu();
     $('batch-modal').classList.remove('hidden');
     $('batch-input').focus();
+});
+
+/**
+ * 切换当前 PDF 的目录深度扫描：开启时会立即重算目录，
+ * 即从 .goodnotes 内嵌的 PDF 附件里读取它自带的书签。
+ */
+async function setDeepScan(enabled) {
+    const input = $('deep-scan-input');
+    input.disabled = true;
+    try {
+        const res = await api(`/api/pdfs/${currentPDFKey}/deep-scan`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ enabled })
+        });
+        const pdf = await res.json();
+        currentOutlineSource = pdf.outline_source || '';
+        const index = allPDFs.findIndex(p => p.id === pdf.id);
+        if (index >= 0) allPDFs[index] = pdf;
+        input.checked = pdf.deep_scan !== false;
+        await loadMarks();
+        showToast(enabled ? '已开启目录深度扫描' : '已关闭目录深度扫描');
+    } catch (err) {
+        input.checked = !enabled;
+        showToast('目录深度扫描设置失败');
+    } finally {
+        input.disabled = false;
+    }
+}
+
+$('deep-scan-input').addEventListener('change', e => {
+    closeMarksMenu();
+    setDeepScan(e.target.checked);
 });
 
 // 关闭模态窗口

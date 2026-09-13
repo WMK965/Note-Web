@@ -88,9 +88,20 @@
     </div>
     <div id="marks-list" class="marks-list"></div>
     <div class="marks-add">
-        <button id="batch-add-btn" class="batch-btn" aria-label="批量添加">
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg>
-        </button>
+        <div class="marks-menu-wrap">
+            <button id="batch-add-btn" class="batch-btn" aria-label="目录与标记选项" aria-haspopup="true" aria-expanded="false">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg>
+            </button>
+            <div id="marks-menu" class="marks-menu hidden">
+                <button id="menu-batch-add" class="marks-menu-item" type="button">
+                    <span>批量添加目录</span>
+                </button>
+                <label class="marks-menu-item" for="deep-scan-input">
+                    <span>目录深度扫描</span>
+                    <input type="checkbox" id="deep-scan-input" class="menu-switch">
+                </label>
+            </div>
+        </div>
         <input type="text" id="mark-title-input" placeholder="标记当前页..." maxlength="50">
         <button id="mark-add-btn" class="mark-add-btn" aria-label="添加">+</button>
     </div>

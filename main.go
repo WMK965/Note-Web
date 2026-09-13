@@ -95,6 +95,7 @@ func main() {
 		log.Fatalf("failed to load embedded web assets: %v", err)
 	}
 	server := api.New(database, cm, r, cfg, webRoot)
+	server.SetOutlineRefresher(s) // 切换目录深度扫描时立即重算目录
 	go func() {
 		if err := server.Start(); err != nil {
 			log.Fatalf("server failed: %v", err)

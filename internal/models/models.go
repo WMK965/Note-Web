@@ -23,6 +23,8 @@ type PDF struct {
 	GoodNotesPath   string     `json:"-"`                 // 同目录同名的 GoodNotes 归档路径
 	GoodNotesSize   int64      `json:"-"`                 // GoodNotes 归档大小（用于变化检测）
 	GoodNotesMtime  int64      `json:"-"`                 // GoodNotes 归档修改时间（用于变化检测）
+	OutlineOrigin   string     `json:"-"`                 // 目录来源：goodnotes / pdf / 空
+	DeepScan        int        `json:"-"`                 // 目录深度扫描偏好：1 开启、0 关闭、-1 自动
 	CacheLastAccess time.Time  `json:"cache_last_access"` // 最后访问时间（用于LRU淘汰）
 	Deleted         bool       `json:"-"`                 // 是否已标记删除（不返回给前端）
 	DeletedAt       *time.Time `json:"-"`                 // 首次被标记删除的时间（用于清理宽限期）

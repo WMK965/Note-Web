@@ -15,9 +15,13 @@ func TestParseKnownSample(t *testing.T) {
 		t.Skipf("sample archive is not available: %v", err)
 	}
 
-	entries, err := ParseFile(path)
+	outline, err := ParseFile(path)
 	if err != nil {
 		t.Fatalf("parse sample: %v", err)
+	}
+	entries := outline.Entries
+	if outline.Source != SourceGoodNotes {
+		t.Errorf("source = %q, want %q", outline.Source, SourceGoodNotes)
 	}
 	wantTitles := []string{"第一章", "第一章第一节", "第二章"}
 	wantPages := []int{2, 3, 4}
@@ -60,9 +64,13 @@ func TestParseSyntheticArchive(t *testing.T) {
 		"index.events.pb": events,
 	})
 
-	entries, err := ParseFile(path)
+	outline, err := ParseFile(path)
 	if err != nil {
 		t.Fatalf("parse synthetic archive: %v", err)
+	}
+	entries := outline.Entries
+	if outline.Source != SourceGoodNotes {
+		t.Errorf("source = %q, want %q", outline.Source, SourceGoodNotes)
 	}
 	wantTitles := []string{"第一章", "第一章第一节", "第二章"}
 	wantPages := []int{2, 3, 4}
@@ -151,6 +159,140 @@ func TestParseFileRejectsOversizedIndex(t *testing.T) {
 	if _, err := ParseFile(path); err == nil {
 		t.Fatal("ParseFile accepted an oversized index")
 	}
+}
+
+// 归档没有 GoodNotes 书签、但内嵌 PDF 自带目录时，应当回退读取那份 PDF 的目录
+func TestParseArchiveFallsBackToEmbeddedPDF(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "imported.goodnotes")
+	pageEvents := []string{
+		"00000000-0000-0000-0000-000000000001",
+		"00000000-0000-0000-0000-000000000002",
+	}
+	notes := make([]byte, 0)
+	for _, pageID := range pageEvents {
+		noteID := adjacentUUID(pageID, 1)
+		note := protobufMessage(protobufString(1, noteID), protobufString(2, "notes/"+noteID))
+		notes = append(notes, protobufDelimited(note)...)
+	}
+	// 只有页面事件，没有任何字段 65 的目录记录
+	events := pageEnvelope(54, pageEvents[0], "a")
+	events = append(events, pageEnvelope(54, pageEvents[1], "b")...)
+	writeArchive(t, path, map[string][]byte{
+		"index.notes.pb":       notes,
+		"index.events.pb":      events,
+		"attachments/embedded": syntheticOutlinePDF(),
+		"attachments/notpdf":   []byte("PNG image data"),
+	})
+
+	outline, err := ParseFile(path)
+	if err != nil {
+		t.Fatalf("parse archive: %v", err)
+	}
+	if outline.Source != SourceDeep {
+		t.Fatalf("source = %q, want %q", outline.Source, SourceDeep)
+	}
+	want := []struct {
+		level int
+		page  int
+		title string
+	}{
+		{0, 1, "Chapter 1"},
+		{1, 2, "第一节"},
+		{0, 2, "Chapter 2"},
+	}
+	if len(outline.Entries) != len(want) {
+		t.Fatalf("entry count = %d, want %d: %+v", len(outline.Entries), len(want), outline.Entries)
+	}
+	for i, w := range want {
+		got := outline.Entries[i]
+		if got.Level != w.level || got.Page != w.page || got.Title != w.title {
+			t.Errorf("entry %d = %+v, want level=%d page=%d title=%q", i, got, w.level, w.page, w.title)
+		}
+	}
+}
+
+// 内嵌附件里没有 PDF 时，应视为该笔记本没有目录
+func TestParseArchiveWithoutPDFAttachment(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "plain.goodnotes")
+	pageID := "00000000-0000-0000-0000-000000000001"
+	noteID := adjacentUUID(pageID, 1)
+	notes := protobufDelimited(protobufMessage(protobufString(1, noteID), protobufString(2, "notes/"+noteID)))
+	writeArchive(t, path, map[string][]byte{
+		"index.notes.pb":  notes,
+		"index.events.pb": pageEnvelope(54, pageID, "a"),
+		"attachments/x":   []byte("PNG data"),
+	})
+
+	outline, err := ParseFile(path)
+	if err != nil {
+		t.Fatalf("parse archive: %v", err)
+	}
+	if len(outline.Entries) != 0 || outline.Source != "" {
+		t.Errorf("outline = %+v, want empty", outline)
+	}
+}
+
+// 关闭深度扫描后，即使内嵌 PDF 自带目录也不应读取
+func TestParseFileWithDeepScanDisabled(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "deep-off.goodnotes")
+	pageID := "00000000-0000-0000-0000-000000000001"
+	noteID := adjacentUUID(pageID, 1)
+	notes := protobufDelimited(protobufMessage(protobufString(1, noteID), protobufString(2, "notes/"+noteID)))
+	writeArchive(t, path, map[string][]byte{
+		"index.notes.pb":       notes,
+		"index.events.pb":      pageEnvelope(54, pageID, "a"),
+		"attachments/embedded": syntheticOutlinePDF(),
+	})
+
+	outline, err := ParseFileWithOptions(path, Options{DeepScan: false})
+	if err != nil {
+		t.Fatalf("parse archive: %v", err)
+	}
+	if len(outline.Entries) != 0 || outline.Source != "" {
+		t.Errorf("deep scan disabled but got %+v", outline)
+	}
+
+	// 默认（自动）模式下应当读到内嵌 PDF 的目录
+	enabled, err := ParseFile(path)
+	if err != nil {
+		t.Fatalf("parse archive with default options: %v", err)
+	}
+	if enabled.Source != SourceDeep || len(enabled.Entries) != 3 {
+		t.Errorf("default options = %+v, want 3 deep-scan entries", enabled)
+	}
+}
+
+// syntheticOutlinePDF 构造一个带两级目录的最小 PDF
+func syntheticOutlinePDF() []byte {
+	return []byte(`%PDF-1.4
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R /Outlines 5 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R >>
+endobj
+4 0 obj
+<< /Type /Page /Parent 2 0 R >>
+endobj
+5 0 obj
+<< /Type /Outlines /First 6 0 R /Last 8 0 R /Count 3 >>
+endobj
+6 0 obj
+<< /Title (Chapter 1) /Parent 5 0 R /Next 8 0 R /First 7 0 R /Dest [3 0 R /XYZ 0 792 0] >>
+endobj
+7 0 obj
+<< /Title <FEFF7B2C4E0082820000> /Parent 6 0 R /Dest [4 0 R /Fit] >>
+endobj
+8 0 obj
+<< /Title (Chapter 2) /Parent 5 0 R /A << /S /GoTo /D [4 0 R /Fit] >> >>
+endobj
+trailer
+<< /Root 1 0 R /Size 9 >>
+%%EOF
+`)
 }
 
 func TestPageAliasesCarriesAcrossUUIDBytes(t *testing.T) {

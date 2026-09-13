@@ -285,3 +285,145 @@ func pbDelimited(value []byte) []byte {
 	result := binary.AppendUvarint(nil, uint64(len(value)))
 	return append(result, value...)
 }
+
+// 深度扫描开关：关闭后应立即清掉从内嵌 PDF 读出的目录，重新开启则恢复
+func TestRefreshOutlineRespectsDeepScanPreference(t *testing.T) {
+	dir := t.TempDir()
+	pdfPath := filepath.Join(dir, "book.pdf")
+	if err := os.WriteFile(pdfPath, []byte("%PDF-1.4 minimal"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(pdfPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	database, err := db.Init(filepath.Join(dir, "note-web.db"))
+	if err != nil {
+		t.Fatalf("db init: %v", err)
+	}
+	t.Cleanup(func() { database.Close() })
+	id, err := database.AddPDF(pdfPath, "book", util.CacheKey(pdfPath), 2, info.Size(), info.ModTime().Unix())
+	if err != nil {
+		t.Fatalf("add pdf: %v", err)
+	}
+	writeImportedArchive(t, filepath.Join(dir, "book.goodnotes"))
+
+	scanner := New(database, nil, config.PDFConfig{Dirs: []string{dir}, ScanInterval: 300, RetentionDays: 30}, config.DatabaseConfig{}, nil)
+	if err := scanner.Scan(); err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+
+	marks, err := database.ListMarks(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(marks) != 3 {
+		t.Fatalf("深度扫描应导入 3 条目录，实际 %d 条: %+v", len(marks), marks)
+	}
+	pdf, err := database.GetPDF(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pdf.OutlineOrigin != "deep" {
+		t.Errorf("outline origin = %q, want %q", pdf.OutlineOrigin, "deep")
+	}
+
+	// 关闭深度扫描 -> 目录立即消失
+	if err := database.SetDeepScan(id, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := scanner.RefreshOutline(id); err != nil {
+		t.Fatalf("refresh with deep scan off: %v", err)
+	}
+	if marks, err := database.ListMarks(id); err != nil || len(marks) != 0 {
+		t.Errorf("关闭深度扫描后仍残留目录: %+v (err=%v)", marks, err)
+	}
+	if pdf, err = database.GetPDF(id); err != nil || pdf.OutlineOrigin != "" {
+		t.Errorf("关闭后 outline origin = %q (err=%v), 期望为空", pdf.OutlineOrigin, err)
+	}
+
+	// 重新开启 -> 目录恢复
+	if err := database.SetDeepScan(id, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := scanner.RefreshOutline(id); err != nil {
+		t.Fatalf("refresh with deep scan on: %v", err)
+	}
+	if marks, err := database.ListMarks(id); err != nil || len(marks) != 3 {
+		t.Errorf("重新开启后目录 = %+v (err=%v), 期望 3 条", marks, err)
+	}
+}
+
+// writeImportedArchive 生成一个没有字段 65 目录、但内嵌带目录 PDF 的归档
+func writeImportedArchive(t *testing.T, path string) {
+	t.Helper()
+	pageIDs := []string{
+		"00000000-0000-0000-0000-000000000001",
+		"00000000-0000-0000-0000-000000000002",
+	}
+	notes := make([]byte, 0)
+	for _, pageID := range pageIDs {
+		noteID := incrementLastHex(pageID)
+		notes = append(notes, pbDelimited(pbMessage(pbString(1, noteID), pbString(2, "notes/"+noteID)))...)
+	}
+	events := append(pbDelimited(pbBytes(54, pbMessage(pbString(2, pageIDs[0]), pbBytes(4, pbString(1, "a"))))),
+		pbDelimited(pbBytes(54, pbMessage(pbString(2, pageIDs[1]), pbBytes(4, pbString(1, "b")))))...)
+
+	file, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	archive := zip.NewWriter(file)
+	for name, data := range map[string][]byte{
+		"index.notes.pb":       notes,
+		"index.events.pb":      events,
+		"attachments/embedded": outlinePDFBytes(),
+	} {
+		writer, err := archive.Create(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := writer.Write(data); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := archive.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// outlinePDFBytes 返回一个带两级目录的最小 PDF
+func outlinePDFBytes() []byte {
+	return []byte(`%PDF-1.4
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R /Outlines 5 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R >>
+endobj
+4 0 obj
+<< /Type /Page /Parent 2 0 R >>
+endobj
+5 0 obj
+<< /Type /Outlines /First 6 0 R /Last 8 0 R /Count 3 >>
+endobj
+6 0 obj
+<< /Title (Chapter 1) /Parent 5 0 R /Next 8 0 R /First 7 0 R /Dest [3 0 R /XYZ 0 792 0] >>
+endobj
+7 0 obj
+<< /Title <FEFF7B2C4E0082820000> /Parent 6 0 R /Dest [4 0 R /Fit] >>
+endobj
+8 0 obj
+<< /Title (Chapter 2) /Parent 5 0 R /A << /S /GoTo /D [4 0 R /Fit] >> >>
+endobj
+trailer
+<< /Root 1 0 R /Size 9 >>
+%%EOF
+`)
+}

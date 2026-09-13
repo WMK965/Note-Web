@@ -4,6 +4,7 @@
 package scanner
 
 import (
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
@@ -14,6 +15,7 @@ import (
 	"note-web/internal/config"
 	"note-web/internal/db"
 	"note-web/internal/goodnotes"
+	"note-web/internal/models"
 	"note-web/internal/renderer"
 	"note-web/internal/util"
 )
@@ -197,26 +199,15 @@ func (s *Scanner) processPDF(path string, info os.FileInfo, companion *scannedFi
 	safeTitle = strings.ReplaceAll(safeTitle, "\r", "")
 
 	if companion != nil {
-		entries, parseErr := goodnotes.ParseFile(companion.path)
-		if parseErr != nil {
+		// 目录深度扫描：磁盘上的 PDF 没有 GoodNotes 目录时，读归档内嵌 PDF 的书签
+		if err := s.applyOutline(id, pageCount, companion.path, companion.info, deepScanEnabled(existing), safeTitle); err != nil {
 			// 自动备份可能正在写入；保留上一次成功结果并在下轮扫描重试。
-			log.Printf("failed to parse GoodNotes outline for %s: %v", companion.path, parseErr)
-		} else {
-			for i := range entries {
-				if entries[i].Page > pageCount {
-					entries[i].Page = 0
-				}
-			}
-			if err := s.db.ReplaceOutlineMarksFromGoodNotes(id, entries, companion.path, companion.info.Size(), companion.info.ModTime().UnixNano()); err != nil {
-				log.Printf("failed to store GoodNotes outline for PDF %d: %v", id, err)
-			} else {
-				log.Printf("loaded %d GoodNotes outline entries for %s", len(entries), safeTitle)
-			}
+			log.Printf("failed to load outline from %s: %v", companion.path, err)
 		}
 	} else if existing != nil && existing.GoodNotesPath != "" {
 		if err := s.db.DeleteOutlineMarks(id); err != nil {
 			log.Printf("failed to clear removed GoodNotes outline for PDF %d: %v", id, err)
-		} else if err := s.db.UpdateGoodNotesSource(id, "", 0, 0); err != nil {
+		} else if err := s.db.SetOutlineSource(id, "", 0, 0, ""); err != nil {
 			log.Printf("failed to clear GoodNotes source for PDF %d: %v", id, err)
 		}
 	} else if pdfChanged && existing != nil {
@@ -245,6 +236,84 @@ func (s *Scanner) processPDF(path string, info os.FileInfo, companion *scannedFi
 	} else if existing != nil && pdfChanged {
 		log.Printf("updated PDF: %s (%d pages)", safeTitle, pageCount)
 	}
+}
+
+// applyOutline 解析归档目录并写入数据库，pageCount 用于把越界页码降级为纯标题
+func (s *Scanner) applyOutline(pdfID int64, pageCount int, companionPath string, info os.FileInfo, deepScan bool, title string) error {
+	outline, err := goodnotes.ParseFileWithOptions(companionPath, goodnotes.Options{DeepScan: deepScan})
+	if err != nil {
+		return err
+	}
+	entries := outline.Entries
+	for i := range entries {
+		if entries[i].Page > pageCount {
+			entries[i].Page = 0
+		}
+	}
+	if err := s.db.ReplaceOutlineMarksFromArchive(pdfID, entries, companionPath, info.Size(), info.ModTime().UnixNano(), outline.Source); err != nil {
+		return err
+	}
+	if len(entries) > 0 {
+		log.Printf("loaded %d %s outline entries for %s", len(entries), outline.Source, title)
+	} else {
+		log.Printf("no outline found in %s", companionPath)
+	}
+	return nil
+}
+
+// deepScanEnabled 读取单个 PDF 的深度扫描偏好：1 开启、0 关闭、-1 自动开启
+func deepScanEnabled(pdf *models.PDF) bool {
+	if pdf == nil {
+		return true
+	}
+	return pdf.DeepScan != 0
+}
+
+// RefreshOutline 立即按当前偏好重新解析某个 PDF 的归档目录。
+// 用户切换“目录深度扫描”后调用，不必等下一轮定时扫描。
+func (s *Scanner) RefreshOutline(pdfID int64) error {
+	pdf, err := s.db.GetPDF(pdfID)
+	if err != nil {
+		return err
+	}
+	if pdf.Deleted {
+		return fmt.Errorf("pdf %d is marked as deleted", pdfID)
+	}
+	companionPath, info, ok := findCompanion(pdf.Path)
+	if !ok {
+		// 没有归档文件时没有可解析的目录来源，保持现状
+		return nil
+	}
+	return s.applyOutline(pdf.ID, pdf.PageCount, companionPath, info, deepScanEnabled(pdf), pdf.Title)
+}
+
+// findCompanion 查找与 PDF 同目录同名的 .goodnotes 文件（大小写不敏感）
+func findCompanion(pdfPath string) (string, os.FileInfo, bool) {
+	base := strings.TrimSuffix(pdfPath, filepath.Ext(pdfPath))
+	for _, extension := range []string{".goodnotes", ".GoodNotes", ".GOODNOTES"} {
+		candidate := base + extension
+		if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
+			return candidate, info, true
+		}
+	}
+	// 其它大小写组合：同目录逐个比对
+	dir := filepath.Dir(pdfPath)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return "", nil, false
+	}
+	want := strings.ToLower(filepath.Base(base) + ".goodnotes")
+	for _, entry := range entries {
+		if entry.IsDir() || strings.ToLower(entry.Name()) != want {
+			continue
+		}
+		info, infoErr := entry.Info()
+		if infoErr != nil {
+			continue
+		}
+		return filepath.Join(dir, entry.Name()), info, true
+	}
+	return "", nil, false
 }
 
 // Start 启动后台定时扫描 goroutine
