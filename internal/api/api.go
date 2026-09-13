@@ -2,29 +2,30 @@
 // 提供 RESTful API 和嵌入式前端静态文件服务
 //
 // API 端点：
-//   GET    /api/pdfs                      - 列出所有PDF（支持 ?pinned 过滤）
-//   GET    /api/pdfs/{key}                - 获取单个PDF信息
-//   GET    /api/pdfs/{key}/page/{n}       - 获取第n页的JPEG图片
-//   GET    /api/pdfs/{key}/thumb/{n}      - 获取第n页的缩略图
-//   PUT    /api/pdfs/{key}/pin            - 标记为主动缓存（触发全量预渲染）
-//   DELETE /api/pdfs/{key}/pin            - 取消主动缓存标记
-//   GET    /api/pdfs/{key}/cache          - 获取缓存状态
-//   POST   /api/pdfs/{key}/render         - 强制重新渲染缓存
-//   GET    /api/pdfs/{key}/marks          - 获取目录和标记列表
-//   POST   /api/pdfs/{key}/marks          - 添加用户自定义标记
-//   DELETE /api/pdfs/{key}/marks/{markId} - 删除用户自定义标记
-//   POST   /api/pdfs/{key}/outline        - 重新提取PDF目录
+//
+//	GET    /api/pdfs                      - 列出所有PDF（支持 ?pinned 过滤）
+//	GET    /api/pdfs/{key}                - 获取单个PDF信息
+//	GET    /api/pdfs/{key}/page/{n}       - 获取第n页的JPEG图片
+//	GET    /api/pdfs/{key}/thumb/{n}      - 获取第n页的缩略图
+//	PUT    /api/pdfs/{key}/pin            - 标记为主动缓存（触发全量预渲染）
+//	DELETE /api/pdfs/{key}/pin            - 取消主动缓存标记
+//	GET    /api/pdfs/{key}/cache          - 获取缓存状态
+//	POST   /api/pdfs/{key}/render         - 强制重新渲染缓存
+//	GET    /api/pdfs/{key}/marks          - 获取目录和标记列表
+//	POST   /api/pdfs/{key}/marks          - 添加用户自定义标记
+//	DELETE /api/pdfs/{key}/marks/{markId} - 删除用户自定义标记
+//	POST   /api/pdfs/{key}/outline        - 重新提取PDF目录
 //
 // {key} 是 cache_key（路径哈希），不是数字ID
 package api
 
 import (
-	"embed"
 	"encoding/json"
 	"fmt"
 	"io/fs"
 	"log"
 	"net/http"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -43,10 +44,11 @@ type Server struct {
 	cache    *cache.Manager
 	renderer *renderer.Renderer
 	cfg      *config.Config
-	webFS    embed.FS
+	webFS    fs.FS
 }
 
-func New(database *db.Database, cm *cache.Manager, r *renderer.Renderer, cfg *config.Config, webFS embed.FS) *Server {
+// New 创建API服务器。webFS 是前端静态文件的根目录（即 web/ 目录本身）。
+func New(database *db.Database, cm *cache.Manager, r *renderer.Renderer, cfg *config.Config, webFS fs.FS) *Server {
 	return &Server{
 		db:       database,
 		cache:    cm,
@@ -56,30 +58,26 @@ func New(database *db.Database, cm *cache.Manager, r *renderer.Renderer, cfg *co
 	}
 }
 
-func (s *Server) Start() error {
+// Handler 构建完整的 HTTP 处理器：路由 + 静态文件 + 安全响应头。
+// 配置了 proxy.base_path 时，同一套路由和静态文件会额外挂载到该前缀下，
+// 便于通过公网 Nginx 以 /proxy-index/ 访问，同时保留 / 的日常访问。
+func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 
-	mux.HandleFunc("GET /api/pdfs", s.handleListPDFs)
-	mux.HandleFunc("GET /api/pdfs/{key}", s.handleGetPDF)
-	mux.HandleFunc("GET /api/pdfs/{key}/page/{n}", s.handleGetPage)
-	mux.HandleFunc("GET /api/pdfs/{key}/thumb/{n}", s.handleGetThumb)
-	mux.HandleFunc("PUT /api/pdfs/{key}/pin", s.handlePin)
-	mux.HandleFunc("DELETE /api/pdfs/{key}/pin", s.handleUnpin)
-	mux.HandleFunc("GET /api/pdfs/{key}/cache", s.handleCacheStatus)
-	mux.HandleFunc("POST /api/pdfs/{key}/render", s.handleForceRender)
-	mux.HandleFunc("GET /api/pdfs/{key}/marks", s.handleListMarks)
-	mux.HandleFunc("POST /api/pdfs/{key}/marks", s.handleAddMark)
-	mux.HandleFunc("DELETE /api/pdfs/{key}/marks/{markId}", s.handleDeleteMark)
-	mux.HandleFunc("PUT /api/pdfs/{key}/marks/reorder", s.handleReorderMarks)
-	mux.HandleFunc("POST /api/pdfs/{key}/marks/batch", s.handleBatchAddMarks)
-	mux.HandleFunc("POST /api/pdfs/{key}/outline", s.handleExtractOutline)
-	mux.HandleFunc("GET /api/cache/stats", s.handleCacheStats)
-
-	fsys, err := fs.Sub(s.webFS, "web")
-	if err != nil {
-		return fmt.Errorf("embed sub: %w", err)
+	s.registerRoutes(mux, "")
+	if s.cfg.Proxy.BasePath != "" {
+		s.registerRoutes(mux, s.cfg.Proxy.BasePath)
 	}
-	mux.Handle("/", http.FileServer(http.FS(fsys)))
+
+	fileServer := http.FileServer(http.FS(s.webFS))
+	if s.cfg.Proxy.BasePath != "" {
+		proxyPath := s.cfg.Proxy.BasePath
+		mux.HandleFunc("GET "+proxyPath, func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, proxyPath+"/", http.StatusMovedPermanently)
+		})
+		mux.Handle(proxyPath+"/", http.StripPrefix(proxyPath+"/", fileServer))
+	}
+	mux.Handle("/", fileServer)
 
 	// 安全响应头中间件（M2）
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -88,12 +86,15 @@ func (s *Server) Start() error {
 		w.Header().Set("Referrer-Policy", "no-referrer")
 		mux.ServeHTTP(w, r)
 	})
+	return handler
+}
 
+func (s *Server) Start() error {
 	// HTTP 服务器超时设置（H1: 防止 Slowloris DoS）
 	addr := fmt.Sprintf("%s:%d", s.cfg.Server.Host, s.cfg.Server.Port)
 	srv := &http.Server{
 		Addr:              addr,
-		Handler:           handler,
+		Handler:           s.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      30 * time.Second,
@@ -101,6 +102,24 @@ func (s *Server) Start() error {
 	}
 	log.Printf("server starting on %s", addr)
 	return srv.ListenAndServe()
+}
+
+func (s *Server) registerRoutes(mux *http.ServeMux, prefix string) {
+	mux.HandleFunc("GET "+prefix+"/api/pdfs", s.handleListPDFs)
+	mux.HandleFunc("GET "+prefix+"/api/pdfs/{key}", s.handleGetPDF)
+	mux.HandleFunc("GET "+prefix+"/api/pdfs/{key}/page/{n}", s.handleGetPage)
+	mux.HandleFunc("GET "+prefix+"/api/pdfs/{key}/thumb/{n}", s.handleGetThumb)
+	mux.HandleFunc("PUT "+prefix+"/api/pdfs/{key}/pin", s.handlePin)
+	mux.HandleFunc("DELETE "+prefix+"/api/pdfs/{key}/pin", s.handleUnpin)
+	mux.HandleFunc("GET "+prefix+"/api/pdfs/{key}/cache", s.handleCacheStatus)
+	mux.HandleFunc("POST "+prefix+"/api/pdfs/{key}/render", s.handleForceRender)
+	mux.HandleFunc("GET "+prefix+"/api/pdfs/{key}/marks", s.handleListMarks)
+	mux.HandleFunc("POST "+prefix+"/api/pdfs/{key}/marks", s.handleAddMark)
+	mux.HandleFunc("DELETE "+prefix+"/api/pdfs/{key}/marks/{markId}", s.handleDeleteMark)
+	mux.HandleFunc("PUT "+prefix+"/api/pdfs/{key}/marks/reorder", s.handleReorderMarks)
+	mux.HandleFunc("POST "+prefix+"/api/pdfs/{key}/marks/batch", s.handleBatchAddMarks)
+	mux.HandleFunc("POST "+prefix+"/api/pdfs/{key}/outline", s.handleExtractOutline)
+	mux.HandleFunc("GET "+prefix+"/api/cache/stats", s.handleCacheStats)
 }
 
 // maxBodySize is the maximum JSON body size (H6: prevents memory exhaustion)
@@ -225,8 +244,7 @@ func (s *Server) handleGetPage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.Header().Set("Cache-Control", "public, max-age=86400")
-	http.ServeFile(w, r, filePath)
+	serveCacheFile(w, r, filePath)
 
 	s.cache.PreloadPages(pdf.ID, pageNum, 2)
 }
@@ -251,7 +269,19 @@ func (s *Server) handleGetThumb(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.Header().Set("Cache-Control", "public, max-age=604800")
+	serveCacheFile(w, r, filePath)
+}
+
+// serveCacheFile 发送缓存页面图片。
+// PDF 内容变化后缓存文件会被替换，因此不能长时间直接复用浏览器缓存
+// （否则用户必须手动清空缓存才能看到更新）。这里改为每次向服务器校验：
+// 未变化时返回 304（几乎无流量），变化时返回新图片。
+func serveCacheFile(w http.ResponseWriter, r *http.Request, filePath string) {
+	if stat, err := os.Stat(filePath); err == nil {
+		// 文件大小 + 纳秒级修改时间足够区分同一秒内的重新渲染
+		w.Header().Set("ETag", fmt.Sprintf(`"%x-%x"`, stat.Size(), stat.ModTime().UnixNano()))
+	}
+	w.Header().Set("Cache-Control", "private, no-cache")
 	http.ServeFile(w, r, filePath)
 }
 
@@ -593,6 +623,14 @@ func (s *Server) extractOutline(pdf *models.PDF) int {
 	}
 	if len(entries) == 0 {
 		return 0
+	}
+	// 目标页不存在的目录项保留标题，但不参与跳转
+	if pdf.PageCount > 0 {
+		for i := range entries {
+			if entries[i].Page > pdf.PageCount {
+				entries[i].Page = 0
+			}
+		}
 	}
 	s.db.DeleteOutlineMarks(pdf.ID)
 	if err := s.db.AddOutlineMarks(pdf.ID, entries); err != nil {

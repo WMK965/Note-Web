@@ -1,0 +1,221 @@
+package api
+
+import (
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"note-web/internal/cache"
+	"note-web/internal/config"
+	"note-web/internal/db"
+	"note-web/internal/renderer"
+	"note-web/internal/util"
+)
+
+type testEnv struct {
+	server *httptest.Server
+	db     *db.Database
+	cfg    *config.Config
+	client *http.Client
+}
+
+// newTestEnv 启动一个使用临时目录的真实 API 服务器（不依赖 pdftoppm）
+func newTestEnv(t *testing.T, basePath string) *testEnv {
+	t.Helper()
+	dir := t.TempDir()
+
+	cfg := config.Default()
+	cfg.Proxy.BasePath = basePath
+	cfg.Database.Path = filepath.Join(dir, "note-web.db")
+	cfg.CacheDir = filepath.Join(dir, "cache")
+	cfg.PDF.Dirs = []string{filepath.Join(dir, "documents")}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("config invalid: %v", err)
+	}
+	if err := os.MkdirAll(cfg.PDF.Dirs[0], 0755); err != nil {
+		t.Fatalf("mkdir documents: %v", err)
+	}
+
+	database, err := db.Init(cfg.Database.Path)
+	if err != nil {
+		t.Fatalf("db init: %v", err)
+	}
+	t.Cleanup(func() { database.Close() })
+
+	r := renderer.New(cfg.Render)
+	cm := cache.New(database, r, cfg)
+	t.Cleanup(cm.Stop)
+
+	webRoot := os.DirFS(filepath.Join("..", "..", "web"))
+	srv := httptest.NewServer(New(database, cm, r, cfg, webRoot).Handler())
+	t.Cleanup(srv.Close)
+
+	return &testEnv{
+		server: srv,
+		db:     database,
+		cfg:    cfg,
+		client: &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse // 不自动跟随重定向，便于断言
+		}},
+	}
+}
+
+func (e *testEnv) get(t *testing.T, path string, headers map[string]string) (*http.Response, string) {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodGet, e.server.URL+path, nil)
+	if err != nil {
+		t.Fatalf("new request %s: %v", path, err)
+	}
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	resp, err := e.client.Do(req)
+	if err != nil {
+		t.Fatalf("GET %s: %v", path, err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body %s: %v", path, err)
+	}
+	return resp, string(body)
+}
+
+// addCachedPDF 写入一条 PDF 记录（不渲染），返回 cache_key
+func (e *testEnv) addCachedPDF(t *testing.T, name string, pageCount int) (string, int64) {
+	t.Helper()
+	pdfPath := filepath.Join(e.cfg.PDF.Dirs[0], name)
+	if err := os.WriteFile(pdfPath, []byte("%PDF-1.4 minimal"), 0644); err != nil {
+		t.Fatalf("write pdf: %v", err)
+	}
+	stat, err := os.Stat(pdfPath)
+	if err != nil {
+		t.Fatalf("stat pdf: %v", err)
+	}
+	key := util.CacheKey(pdfPath)
+	id, err := e.db.AddPDF(pdfPath, name, key, pageCount, stat.Size(), stat.ModTime().Unix())
+	if err != nil {
+		t.Fatalf("add pdf: %v", err)
+	}
+	return key, id
+}
+
+func (e *testEnv) writePage(t *testing.T, key string, page int, content string) string {
+	t.Helper()
+	path := filepath.Join(e.cfg.CacheDir, key, "p0001.jpg")
+	if page != 1 {
+		t.Fatalf("test helper only supports page 1")
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		t.Fatalf("mkdir cache: %v", err)
+	}
+	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		t.Fatalf("write page: %v", err)
+	}
+	return path
+}
+
+// 代理前缀下必须同时提供前端页面和 /api 接口，且根路径不受影响
+func TestProxyBasePathServesAppAndApi(t *testing.T) {
+	env := newTestEnv(t, "/proxy-index")
+
+	cases := []struct {
+		path       string
+		wantStatus int
+		wantSubstr string
+		wantCType  string
+	}{
+		{path: "/", wantStatus: 200, wantSubstr: "Note-Web"},
+		{path: "/proxy-index/", wantStatus: 200, wantSubstr: "Note-Web"},
+		{path: "/proxy-index/style.css", wantStatus: 200, wantCType: "text/css"},
+		{path: "/proxy-index/app.js", wantStatus: 200, wantCType: "text/javascript"},
+		{path: "/proxy-index/api/pdfs", wantStatus: 200, wantSubstr: "[]"},
+		{path: "/api/pdfs", wantStatus: 200, wantSubstr: "[]"},
+	}
+	for _, tc := range cases {
+		resp, body := env.get(t, tc.path, nil)
+		if resp.StatusCode != tc.wantStatus {
+			t.Errorf("GET %s: status = %d, want %d", tc.path, resp.StatusCode, tc.wantStatus)
+		}
+		if tc.wantSubstr != "" && !strings.Contains(body, tc.wantSubstr) {
+			t.Errorf("GET %s: body does not contain %q", tc.path, tc.wantSubstr)
+		}
+		if tc.wantCType != "" && !strings.HasPrefix(resp.Header.Get("Content-Type"), tc.wantCType) {
+			t.Errorf("GET %s: content-type = %q, want %q", tc.path, resp.Header.Get("Content-Type"), tc.wantCType)
+		}
+	}
+
+	// 不带斜杠的前缀重定向到带斜杠形式
+	resp, _ := env.get(t, "/proxy-index", nil)
+	if resp.StatusCode != http.StatusMovedPermanently {
+		t.Errorf("GET /proxy-index: status = %d, want 301", resp.StatusCode)
+	}
+	if loc := resp.Header.Get("Location"); loc != "/proxy-index/" {
+		t.Errorf("GET /proxy-index: Location = %q, want /proxy-index/", loc)
+	}
+
+	// 静态资源必须以相对路径引用，否则代理前缀下会 404
+	_, body := env.get(t, "/", nil)
+	if strings.Contains(body, `src="/app.js"`) || strings.Contains(body, `href="/style.css"`) {
+		t.Error("index.html 使用了根路径绝对地址，代理前缀下会加载失败")
+	}
+}
+
+// 未配置代理前缀时，同名路径应保持 404，避免意外暴露入口
+func TestProxyBasePathDisabledByDefault(t *testing.T) {
+	env := newTestEnv(t, "")
+
+	if resp, _ := env.get(t, "/proxy-index/", nil); resp.StatusCode != http.StatusNotFound {
+		t.Errorf("GET /proxy-index/: status = %d, want 404", resp.StatusCode)
+	}
+	if resp, _ := env.get(t, "/proxy-index/api/pdfs", nil); resp.StatusCode != http.StatusNotFound {
+		t.Errorf("GET /proxy-index/api/pdfs: status = %d, want 404", resp.StatusCode)
+	}
+	if resp, body := env.get(t, "/api/pdfs", nil); resp.StatusCode != 200 || !strings.Contains(body, "[]") {
+		t.Errorf("GET /api/pdfs: status = %d body = %q", resp.StatusCode, body)
+	}
+}
+
+// 页面图片必须可校验：内容变化后客户端能拿到新图，而不是一直看浏览器里的旧缓存
+func TestPageImageRevalidation(t *testing.T) {
+	env := newTestEnv(t, "")
+	key, _ := env.addCachedPDF(t, "doc.pdf", 1)
+	pagePath := env.writePage(t, key, 1, "page-content-v1")
+
+	resp, body := env.get(t, "/api/pdfs/"+key+"/page/1", nil)
+	if resp.StatusCode != 200 || body != "page-content-v1" {
+		t.Fatalf("first GET: status = %d body = %q", resp.StatusCode, body)
+	}
+	etag := resp.Header.Get("ETag")
+	if etag == "" {
+		t.Fatal("响应缺少 ETag，客户端无法判断页面是否变化")
+	}
+	if cc := resp.Header.Get("Cache-Control"); cc != "private, no-cache" {
+		t.Errorf("Cache-Control = %q, want %q", cc, "private, no-cache")
+	}
+
+	// 未变化的页面：条件请求应返回 304
+	resp, _ = env.get(t, "/api/pdfs/"+key+"/page/1", map[string]string{"If-None-Match": etag})
+	if resp.StatusCode != http.StatusNotModified {
+		t.Errorf("未变化时 status = %d, want 304", resp.StatusCode)
+	}
+
+	// 页面被重新渲染：条件请求必须返回新内容
+	future := time.Now().Add(2 * time.Second)
+	if err := os.WriteFile(pagePath, []byte("page-content-v2-changed"), 0644); err != nil {
+		t.Fatalf("rewrite page: %v", err)
+	}
+	if err := os.Chtimes(pagePath, future, future); err != nil {
+		t.Fatalf("chtimes: %v", err)
+	}
+
+	resp, body = env.get(t, "/api/pdfs/"+key+"/page/1", map[string]string{"If-None-Match": etag})
+	if resp.StatusCode != 200 || body != "page-content-v2-changed" {
+		t.Errorf("变化后 status = %d body = %q, want 200 与新内容", resp.StatusCode, body)
+	}
+}

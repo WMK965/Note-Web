@@ -18,18 +18,24 @@ import (
 
 // Scanner 是目录扫描器，负责发现和索引 PDF 文件
 type Scanner struct {
-	db       *db.Database          // 数据库实例
-	renderer *renderer.Renderer   // 渲染器（用于获取PDF页数和标题）
-	dirs     []string             // 要扫描的目录列表
-	interval time.Duration        // 定时扫描间隔
-	stopCh   chan struct{}        // 停止信号通道
+	db       *db.Database       // 数据库实例
+	renderer *renderer.Renderer // 渲染器（用于获取PDF页数和标题）
+	cache    cacheInvalidator   // 缓存失效器
+	dirs     []string           // 要扫描的目录列表
+	interval time.Duration      // 定时扫描间隔
+	stopCh   chan struct{}      // 停止信号通道
+}
+
+type cacheInvalidator interface {
+	InvalidatePDF(pdfID int64) error
 }
 
 // New 创建扫描器实例
-func New(database *db.Database, r *renderer.Renderer, cfg config.PDFConfig) *Scanner {
+func New(database *db.Database, r *renderer.Renderer, cfg config.PDFConfig, cache cacheInvalidator) *Scanner {
 	return &Scanner{
 		db:       database,
 		renderer: r,
+		cache:    cache,
 		dirs:     cfg.Dirs,
 		interval: time.Duration(cfg.ScanInterval) * time.Second,
 		stopCh:   make(chan struct{}),
@@ -93,7 +99,7 @@ func (s *Scanner) Scan() error {
 
 // processPDF 处理单个 PDF 文件
 // 如果文件是新的或已变更（mtime/size 不同），获取其页数和标题并写入数据库
-// 如果文件已被标记为缓存(pinned)且发生了变更，更新元数据（页数可能变化）
+// 如果未 pinned 的 PDF 发生变更，清除旧缓存，避免继续显示旧页面。
 func (s *Scanner) processPDF(path string, info os.FileInfo) {
 	mtime := info.ModTime().Unix()
 
@@ -120,17 +126,28 @@ func (s *Scanner) processPDF(path string, info os.FileInfo) {
 		return
 	}
 
-	// 如果已标记缓存的PDF发生变更，更新元数据
-	// （缓存重建由 watcher 通过 debounce 机制触发，这里只更新页数等信息）
-	if existing != nil && existing.Pinned && (existing.FileMtime != mtime || existing.FileSize != info.Size()) {
-		log.Printf("pinned PDF changed: %s (id=%d), page count: %d -> %d",
-			path, id, existing.PageCount, pdfInfo.PageCount)
-		s.db.UpdatePDFMetadata(id, pdfInfo.PageCount, info.Size(), mtime)
-	}
-
 	// 日志输出（L5: 清理标题中的换行和ANSI转义序列）
 	safeTitle := strings.ReplaceAll(pdfInfo.Title, "\n", " ")
 	safeTitle = strings.ReplaceAll(safeTitle, "\r", "")
+
+	if existing != nil && (existing.FileMtime != mtime || existing.FileSize != info.Size()) {
+		// 文件内容变了，PDF 自带目录也可能变了：清除旧目录项，下次打开时重新提取
+		if err := s.db.DeleteOutlineMarks(existing.ID); err != nil {
+			log.Printf("failed to reset outline for updated PDF %d: %v", existing.ID, err)
+		}
+		if existing.Pinned {
+			// pinned PDF 由 watcher 的 debounce 负责触发增量重渲染。
+			log.Printf("pinned PDF changed: %s (id=%d), page count: %d -> %d",
+				path, id, existing.PageCount, pdfInfo.PageCount)
+		} else if existing.CachedPages > 0 && s.cache != nil {
+			if err := s.cache.InvalidatePDF(existing.ID); err != nil {
+				log.Printf("failed to invalidate cache for updated PDF %d: %v", existing.ID, err)
+			} else {
+				log.Printf("invalidated cache for updated PDF %d: %s", existing.ID, safeTitle)
+			}
+		}
+	}
+
 	if id > 0 && existing == nil {
 		log.Printf("new PDF: %s (%d pages, %.1fMB)", safeTitle, pdfInfo.PageCount, float64(info.Size())/(1024*1024))
 	} else if existing != nil && existing.FileMtime != mtime {

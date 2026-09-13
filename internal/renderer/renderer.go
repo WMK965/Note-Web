@@ -10,6 +10,7 @@ package renderer
 import (
 	"context"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -24,9 +25,9 @@ import (
 
 // 子进程超时设置
 const (
-	renderTimeout  = 60 * time.Second // pdftoppm 渲染单页超时
-	infoTimeout    = 10 * time.Second // pdfinfo/mutool 超时
-	maxPageCount   = 10000            // 页数上限，防止恶意PDF DoS（H3）
+	renderTimeout = 60 * time.Second // pdftoppm 渲染单页超时
+	infoTimeout   = 10 * time.Second // pdfinfo/mutool 超时
+	maxPageCount  = 10000            // 页数上限，防止恶意PDF DoS（H3）
 )
 
 type Renderer struct {
@@ -176,6 +177,14 @@ func CheckDependencies() error {
 
 // GetOutline 使用 mutool 提取PDF目录
 // 安全：CommandContext 超时（M3），-- 防参数注入（M4）
+//
+// 输出格式（每行一条目录项，按层级缩进）：
+//
+//	<状态字符><制表符×N>"标题"<制表符>uri
+//
+// 状态字符：'|' 无子项，'+' 有子项（展开），'-' 有子项（折叠）
+// N = 层级 + 1（第一个制表符是分隔符，其余为缩进）
+// uri 形如 "#page=24&zoom=nan,0,-.29"，页码从 1 开始
 func (r *Renderer) GetOutline(pdfPath string) ([]models.OutlineEntry, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), infoTimeout)
 	defer cancel()
@@ -186,33 +195,148 @@ func (r *Renderer) GetOutline(pdfPath string) ([]models.OutlineEntry, error) {
 		return nil, fmt.Errorf("mutool show outline failed: %w", err)
 	}
 
+	entries := parseMutoolOutline(string(output))
+	if len(entries) == 0 && strings.TrimSpace(string(output)) != "" {
+		log.Printf("outline: parsed no entries from mutool output for %s", pdfPath)
+	}
+	return entries, nil
+}
+
+// maxOutlineDepth 限制目录层级，防止异常输入产生超深缩进
+const maxOutlineDepth = 20
+
+// parseMutoolOutline 解析 mutool show <pdf> outline 的输出
+func parseMutoolOutline(output string) []models.OutlineEntry {
 	var entries []models.OutlineEntry
-	for _, line := range strings.Split(string(output), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" {
+
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimSuffix(line, "\r")
+		if len(line) < 2 {
 			continue
 		}
-		parts := strings.SplitN(line, "\t", 3)
-		if len(parts) < 3 {
+		// 状态字符标识该项在目录树中的位置，其他行（如警告）直接忽略
+		switch line[0] {
+		case '|', '+', '-':
+		default:
 			continue
 		}
-		level, _ := strconv.Atoi(strings.TrimSpace(parts[0]))
-		page, _ := strconv.Atoi(strings.TrimSpace(parts[1]))
-		title := strings.TrimSpace(parts[2])
+
+		rest := line[1:]
+		indent := 0
+		for len(rest) > 0 && rest[0] == '\t' {
+			indent++
+			rest = rest[1:]
+		}
+		level := indent - 1 // 第一个制表符是分隔符，其余才是缩进
+		if level < 0 {
+			level = 0
+		}
+		if level > maxOutlineDepth {
+			level = maxOutlineDepth
+		}
+
+		if !strings.HasPrefix(rest, `"`) {
+			continue
+		}
+		title, tail, ok := parseQuotedString(rest)
+		if !ok {
+			continue
+		}
+		title = cleanOutlineTitle(title)
 		if title == "" {
 			continue
 		}
-		// 页数上限校验
-		if page > maxPageCount {
-			continue
-		}
+
 		entries = append(entries, models.OutlineEntry{
 			Level: level,
-			Page:  page,
+			Page:  outlinePageFromURI(strings.TrimSpace(tail)),
 			Title: title,
 		})
 	}
-	return entries, nil
+
+	return entries
+}
+
+// parseQuotedString 解析 mutool 输出的带引号字符串（如 `"第一章\x00"`）
+// 返回字符串内容、剩余部分以及是否正常闭合
+func parseQuotedString(s string) (value string, rest string, ok bool) {
+	if !strings.HasPrefix(s, `"`) {
+		return "", s, false
+	}
+
+	var b strings.Builder
+	for i := 1; i < len(s); {
+		c := s[i]
+		switch {
+		case c == '"':
+			return b.String(), s[i+1:], true
+		case c == '\\' && i+1 < len(s):
+			esc := s[i+1]
+			if esc == 'x' && i+3 < len(s) {
+				if v, err := strconv.ParseUint(s[i+2:i+4], 16, 8); err == nil {
+					b.WriteByte(byte(v))
+					i += 4
+					continue
+				}
+			}
+			switch esc {
+			case 'n':
+				b.WriteByte('\n')
+			case 'r':
+				b.WriteByte('\r')
+			case 't':
+				b.WriteByte('\t')
+			case 'b':
+				b.WriteByte('\b')
+			case 'f':
+				b.WriteByte('\f')
+			default:
+				b.WriteByte(esc) // \" \\ 以及未识别的转义
+			}
+			i += 2
+		default:
+			b.WriteByte(c)
+			i++
+		}
+	}
+
+	return b.String(), "", false // 引号未闭合
+}
+
+// cleanOutlineTitle 去掉标题中的控制字符（PDF元数据里常见的结尾 NUL）和首尾空白
+func cleanOutlineTitle(title string) string {
+	cleaned := strings.Map(func(r rune) rune {
+		if r == 0 || r < 0x20 || r == 0x7f {
+			return -1
+		}
+		return r
+	}, title)
+	return strings.TrimSpace(cleaned)
+}
+
+// outlinePageFromURI 从 mutool 的目标 URI 中取出页码（1-based）
+// 形如 "#page=24&zoom=nan,0,-.29"；命名目标等无法解析的形式返回 0（不跳转）
+func outlinePageFromURI(uri string) int {
+	const marker = "#page="
+	idx := strings.Index(uri, marker)
+	if idx < 0 {
+		return 0
+	}
+
+	digits := uri[idx+len(marker):]
+	end := 0
+	for end < len(digits) && digits[end] >= '0' && digits[end] <= '9' {
+		end++
+	}
+	if end == 0 {
+		return 0
+	}
+
+	page, err := strconv.Atoi(digits[:end])
+	if err != nil || page > maxPageCount {
+		return 0
+	}
+	return page
 }
 
 func HasMutool() bool {

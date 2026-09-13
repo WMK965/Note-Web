@@ -6,6 +6,7 @@ package main
 import (
 	"embed"
 	"flag"
+	"io/fs"
 	"log"
 	"os"
 	"os/signal"
@@ -65,7 +66,7 @@ func main() {
 	cm := cache.New(database, r, cfg)
 
 	// 创建目录扫描器（递归扫描配置目录，自动发现PDF文件）
-	s := scanner.New(database, r, cfg.PDF)
+	s := scanner.New(database, r, cfg.PDF, cm)
 	if err := s.Scan(); err != nil { // 启动时立即执行一次完整扫描
 		log.Printf("initial scan failed: %v", err)
 	}
@@ -89,7 +90,11 @@ func main() {
 	w.Start()
 
 	// 启动 HTTP API 服务器（同时提供前端静态文件服务）
-	server := api.New(database, cm, r, cfg, webFS)
+	webRoot, err := fs.Sub(webFS, "web")
+	if err != nil {
+		log.Fatalf("failed to load embedded web assets: %v", err)
+	}
+	server := api.New(database, cm, r, cfg, webRoot)
 	go func() {
 		if err := server.Start(); err != nil {
 			log.Fatalf("server failed: %v", err)

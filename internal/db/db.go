@@ -4,21 +4,22 @@
 // 数据库采用 WAL 模式提高并发读写性能
 //
 // 表结构：
-//   pdfs        - PDF 文件记录（路径、页数、缓存状态等）
-//   page_marks  - 页面标记（PDF自带目录 + 用户自定义标记）
+//
+//	pdfs        - PDF 文件记录（路径、页数、缓存状态等）
+//	page_marks  - 页面标记（PDF自带目录 + 用户自定义标记）
 package db
 
 import (
 	"database/sql"
 	"log"
+	"strconv"
+	"strings"
 	"time"
 
 	"note-web/internal/models"
 
 	_ "modernc.org/sqlite"
 )
-
-
 
 type Database struct {
 	*sql.DB
@@ -54,6 +55,8 @@ func migrate(db *sql.DB) error {
 			cache_size INTEGER NOT NULL DEFAULT 0,
 			cached_pages INTEGER NOT NULL DEFAULT 0,
 			cache_last_access TIMESTAMP,
+			cache_version INTEGER NOT NULL DEFAULT 0,
+			changed_pages TEXT NOT NULL DEFAULT '',
 			deleted INTEGER NOT NULL DEFAULT 0,
 			rebuilding INTEGER NOT NULL DEFAULT 0,
 			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -76,6 +79,20 @@ func migrate(db *sql.DB) error {
 	if colCount == 0 {
 		if _, err := db.Exec(`ALTER TABLE pdfs ADD COLUMN rebuilding INTEGER NOT NULL DEFAULT 0`); err != nil {
 			log.Printf("migration: failed to add rebuilding column: %v", err)
+		}
+	}
+
+	db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('pdfs') WHERE name = 'cache_version'`).Scan(&colCount)
+	if colCount == 0 {
+		if _, err := db.Exec(`ALTER TABLE pdfs ADD COLUMN cache_version INTEGER NOT NULL DEFAULT 0`); err != nil {
+			log.Printf("migration: failed to add cache_version column: %v", err)
+		}
+	}
+
+	db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('pdfs') WHERE name = 'changed_pages'`).Scan(&colCount)
+	if colCount == 0 {
+		if _, err := db.Exec(`ALTER TABLE pdfs ADD COLUMN changed_pages TEXT NOT NULL DEFAULT ''`); err != nil {
+			log.Printf("migration: failed to add changed_pages column: %v", err)
 		}
 	}
 
@@ -114,12 +131,35 @@ func migrate(db *sql.DB) error {
 		}
 	}
 
+	// 目录解析版本：旧版本按错误的格式解析 mutool 输出，提取出的目录项
+	// 标题和页码都是错的，且没有父子关系，需要清除后重新提取。
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT '')`); err != nil {
+		log.Printf("migration: failed to create meta table: %v", err)
+	}
+	var outlineParser string
+	db.QueryRow(`SELECT value FROM meta WHERE key = ?`, keyOutlineParser).Scan(&outlineParser)
+	if outlineParser != outlineParserVersion {
+		if _, err := db.Exec(`DELETE FROM page_marks WHERE is_outline = 1`); err != nil {
+			log.Printf("migration: failed to drop stale outline marks: %v", err)
+		}
+		if _, err := db.Exec(`INSERT INTO meta (key, value) VALUES (?, ?)
+			ON CONFLICT(key) DO UPDATE SET value = excluded.value`, keyOutlineParser, outlineParserVersion); err != nil {
+			log.Printf("migration: failed to record outline parser version: %v", err)
+		}
+	}
+
 	return err
 }
 
+// 目录解析逻辑的版本号，变更解析方式时递增即可让旧数据重新提取
+const (
+	keyOutlineParser     = "outline_parser"
+	outlineParserVersion = "2"
+)
+
 const pdfColumns = `id, path, title, cache_key, page_count, file_size, file_mtime,
 		       pinned, cache_active, cache_size, cached_pages, cache_last_access,
-		       deleted, rebuilding, created_at, updated_at`
+		       deleted, rebuilding, cache_version, changed_pages, created_at, updated_at`
 
 func scanPDF(r interface{ Scan(...interface{}) error }) (*models.PDF, error) {
 	p := &models.PDF{}
@@ -128,7 +168,7 @@ func scanPDF(r interface{ Scan(...interface{}) error }) (*models.PDF, error) {
 	if err := r.Scan(
 		&p.ID, &p.Path, &p.Title, &p.CacheKey, &p.PageCount, &p.FileSize, &p.FileMtime,
 		&pinned, &cacheActive, &p.CacheSize, &p.CachedPages, &cacheLastAccess,
-		&deleted, &rebuilding, &p.CreatedAt, &p.UpdatedAt,
+		&deleted, &rebuilding, &p.CacheVersion, &p.ChangedPages, &p.CreatedAt, &p.UpdatedAt,
 	); err != nil {
 		return nil, err
 	}
@@ -154,7 +194,7 @@ func scanPDFs(rows *sql.Rows) ([]*models.PDF, error) {
 }
 
 func (db *Database) AddPDF(path, title, cacheKey string, pageCount int, fileSize int64, fileMtime int64) (int64, error) {
-	res, err := db.Exec(`
+	_, err := db.Exec(`
 		INSERT INTO pdfs (path, title, cache_key, page_count, file_size, file_mtime, created_at, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(path) DO UPDATE SET
@@ -173,7 +213,11 @@ func (db *Database) AddPDF(path, title, cacheKey string, pageCount int, fileSize
 	if err != nil {
 		return 0, err
 	}
-	return res.LastInsertId()
+	var id int64
+	if err := db.QueryRow(`SELECT id FROM pdfs WHERE path = ?`, path).Scan(&id); err != nil {
+		return 0, err
+	}
+	return id, nil
 }
 
 func (db *Database) GetPDF(id int64) (*models.PDF, error) {
@@ -218,9 +262,9 @@ func (db *Database) ListWatchablePDFs() ([]*models.PDF, error) {
 	return scanPDFs(rows)
 }
 
-func (db *Database) UpdatePDFMetadata(id int64, pageCount int, fileSize int64, fileMtime int64) error {
-	_, err := db.Exec(`UPDATE pdfs SET page_count = ?, file_size = ?, file_mtime = ?, updated_at = ? WHERE id = ?`,
-		pageCount, fileSize, fileMtime, time.Now(), id)
+func (db *Database) UpdatePDFMetadata(id int64, title string, pageCount int, fileSize int64, fileMtime int64) error {
+	_, err := db.Exec(`UPDATE pdfs SET title = ?, page_count = ?, file_size = ?, file_mtime = ?, updated_at = ? WHERE id = ?`,
+		title, pageCount, fileSize, fileMtime, time.Now(), id)
 	return err
 }
 
@@ -308,21 +352,66 @@ func (db *Database) ClearCacheStats(id int64) error {
 	return err
 }
 
+// RecordCacheChange 记录一次缓存内容变化：版本号递增，并保存本次变化的页码。
+// changedPages 为 nil 表示变化范围未知（例如整份缓存被清除），前端需要按“全部可能变化”处理。
+// 前端通过版本号判断文档是否更新，并通过页码列表只刷新真正变化的页面。
+func (db *Database) RecordCacheChange(id int64, changedPages []int) error {
+	_, err := db.Exec(`UPDATE pdfs SET cache_version = cache_version + 1, changed_pages = ?, updated_at = ? WHERE id = ?`,
+		FormatPageNumbers(changedPages), time.Now(), id)
+	return err
+}
+
+// FormatPageNumbers 将页码列表编码为数据库存储格式（逗号分隔）。
+// nil 和空列表都编码为空字符串，表示变化范围未知。
+func FormatPageNumbers(pages []int) string {
+	if len(pages) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(pages))
+	for _, p := range pages {
+		parts = append(parts, strconv.Itoa(p))
+	}
+	return strings.Join(parts, ",")
+}
+
+// ParsePageNumbers 解析 FormatPageNumbers 写入的页码列表。
+// 空字符串解析为 nil（变化范围未知）。
+func ParsePageNumbers(s string) []int {
+	if strings.TrimSpace(s) == "" {
+		return nil
+	}
+	parts := strings.Split(s, ",")
+	pages := make([]int, 0, len(parts))
+	for _, part := range parts {
+		if p, err := strconv.Atoi(strings.TrimSpace(part)); err == nil {
+			pages = append(pages, p)
+		}
+	}
+	if len(pages) == 0 {
+		return nil
+	}
+	return pages
+}
+
 func (db *Database) GetCacheStatus(id int64) (*models.CacheStatus, error) {
 	var pinned, cacheActive, rebuilding int
 	var pageCount, cachedPages int
 	var cacheSize int64
-	err := db.QueryRow(`SELECT page_count, cached_pages, cache_size, pinned, cache_active, rebuilding FROM pdfs WHERE id = ?`, id).
-		Scan(&pageCount, &cachedPages, &cacheSize, &pinned, &cacheActive, &rebuilding)
+	var cacheVersion int64
+	var changedPages string
+	err := db.QueryRow(`SELECT page_count, cached_pages, cache_size, pinned, cache_active, rebuilding, cache_version, changed_pages FROM pdfs WHERE id = ?`, id).
+		Scan(&pageCount, &cachedPages, &cacheSize, &pinned, &cacheActive, &rebuilding, &cacheVersion, &changedPages)
 	if err != nil {
 		return nil, err
 	}
 	return &models.CacheStatus{
-		Pinned:     pinned == 1,
-		Total:      pageCount,
-		Cached:     cachedPages,
-		CacheSize:  cacheSize / (1024 * 1024),
-		Rebuilding: rebuilding == 1,
+		Pinned:       pinned == 1,
+		Total:        pageCount,
+		Cached:       cachedPages,
+		CacheSize:    cacheSize / (1024 * 1024),
+		Rebuilding:   rebuilding == 1,
+		Version:      cacheVersion,
+		ChangedPages: ParsePageNumbers(changedPages),
 	}, nil
 }
 
@@ -448,12 +537,39 @@ func (db *Database) AddOutlineMarks(pdfID int64, entries []models.OutlineEntry) 
 	if err != nil {
 		return err
 	}
+
+	// 按层级维护祖先栈，为每个目录项算出父级：
+	// 前端按 parent_id 渲染树形目录，缺失父级就会退化为平铺列表
+	var stack []int64
 	for i, e := range entries {
-		if _, err := tx.Exec(`INSERT INTO page_marks (pdf_id, page_num, title, level, is_outline, sort_order) VALUES (?, ?, ?, ?, 1, ?)`,
-			pdfID, e.Page, e.Title, e.Level, float64(i+1)); err != nil {
+		level := e.Level
+		if level < 0 {
+			level = 0
+		}
+		if level > len(stack) {
+			level = len(stack) // 层级跳跃时挂到当前最深的祖先，避免悬空父级
+		}
+		stack = stack[:level]
+
+		var parentID interface{}
+		if len(stack) > 0 {
+			parentID = stack[len(stack)-1]
+		}
+
+		res, err := tx.Exec(`INSERT INTO page_marks (pdf_id, page_num, title, level, is_outline, parent_id, sort_order)
+			VALUES (?, ?, ?, ?, 1, ?, ?)`,
+			pdfID, e.Page, e.Title, level, parentID, float64(i+1))
+		if err != nil {
 			tx.Rollback()
 			return err
 		}
+
+		id, err := res.LastInsertId()
+		if err != nil {
+			tx.Rollback()
+			return err
+		}
+		stack = append(stack, id)
 	}
 	return tx.Commit()
 }

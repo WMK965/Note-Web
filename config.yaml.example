@@ -2,6 +2,19 @@ server:
   host: "0.0.0.0"
   port: 8080
 
+proxy:
+  # Optional. When set, the whole app (frontend + API) is ALSO exposed under
+  # this prefix, e.g. "/proxy-index" -> /proxy-index/ and /proxy-index/api/*,
+  # while / and /api/* keep working as before.
+  # This lets an Nginx reverse proxy publish the app on the public internet
+  # without rewriting paths:
+  #   location /proxy-index/ { proxy_pass http://note-web:8080; }
+  #
+  # Alternatively leave this empty and let Nginx strip an arbitrary public
+  # prefix; the frontend derives its API prefix from the browser URL:
+  #   location /notes/ { proxy_pass http://note-web:8080/; }
+  base_path: ""
+
 pdf:
   dirs:
     - /documents

@@ -44,6 +44,17 @@ let panOrigY = 0;            // 单指拖拽开始时的 panY 值
 let swipeStartX = 0;         // 滑动手势开始时的 X 坐标
 let swipeStartY = 0;         // 滑动手势开始时的 Y 坐标
 
+// 根据当前入口路径推断 API 前缀：
+// /                 -> /api/...
+// /proxy-index/     -> /proxy-index/api/...
+// /proxy-index      -> 服务端会重定向到 /proxy-index/
+const APP_BASE_PATH = (() => {
+    let path = location.pathname || '/';
+    if (path.endsWith('/index.html')) path = path.slice(0, -'/index.html'.length) || '/';
+    path = path.replace(/\/+$/, '');
+    return path === '' || path === '/' ? '' : path;
+})();
+
 // ===== SVG 图标常量 =====
 const ICON_FOLDER = '<svg class="folder-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>';
 const ICON_FILE = '<svg class="pdf-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg>';
@@ -81,7 +92,7 @@ function showToast(msg, duration = 2000) {
 
 /** 发起 API 请求，返回 Response 对象，失败时抛出异常 */
 async function api(path, opts) {
-    const res = await fetch(path, opts);
+    const res = await fetch(apiPath(path), opts);
     if (!res.ok) {
         const err = await res.json().catch(() => ({ error: res.statusText }));
         throw new Error(err.error || 'Request failed');
@@ -91,14 +102,26 @@ async function api(path, opts) {
 
 /** 发起 GET 请求并解析 JSON 响应 */
 async function apiJSON(path) {
-    const res = await fetch(path);
+    const res = await fetch(apiPath(path));
     if (!res.ok) throw new Error('Request failed');
     return res.json();
 }
 
-/** 根据页码生成对应页面的 API URL */
-function pageURL(page) {
-    return `/api/pdfs/${currentPDFKey}/page/${page}`;
+/** 给站点子路径代理补上前缀 */
+function apiPath(path) {
+    if (!APP_BASE_PATH || /^https?:\/\//i.test(path)) return path;
+    return APP_BASE_PATH + path;
+}
+
+/**
+ * 根据页码生成对应页面的 API URL
+ * @param {number} page - 页码
+ * @param {string|number} [bust] - 缓存版本号。传入时会在 URL 上附加 v 参数，
+ *   强制浏览器重新获取该页（用于页面内容已更新的场景）
+ */
+function pageURL(page, bust) {
+    const url = apiPath(`/api/pdfs/${currentPDFKey}/page/${page}`);
+    return bust ? `${url}?v=${encodeURIComponent(bust)}` : url;
 }
 
 // ===== URL 路由 =====
@@ -154,6 +177,7 @@ async function loadCacheStats() {
 
 /** 显示指定文件夹的内容，隐藏阅读器 */
 function showFolder(folder) {
+    stopDocWatch();
     currentFolder = folder;
     $('library').classList.remove('hidden');
     $('reader').classList.add('hidden');
@@ -375,6 +399,89 @@ async function pollCacheStatus(key, pdf) {
     }, 3000);
 }
 
+// ===== 文档更新监视 =====
+//
+// 阅读器打开期间每 10 秒查询一次缓存状态。后端重新渲染缓存时 cache_version 递增，
+// 并在 changed_pages 中给出本次真正变化的页码，因此客户端只需要刷新变化的页面，
+// 而不必让用户手动清空缓存或重新下载整份文档。
+
+const DOC_WATCH_INTERVAL = 10000;  // 轮询间隔（毫秒）
+let docWatchTimer = null;          // 定时器句柄
+let docCacheVersion = null;        // 已同步的缓存版本号
+
+/** 开始监视当前文档的更新（重复调用会先清理旧定时器） */
+function startDocWatch() {
+    stopDocWatch();
+    docWatchTimer = setInterval(checkDocUpdate, DOC_WATCH_INTERVAL);
+}
+
+/** 停止监视（离开阅读器时调用） */
+function stopDocWatch() {
+    if (docWatchTimer) { clearInterval(docWatchTimer); docWatchTimer = null; }
+    docCacheVersion = null;
+}
+
+/** 查询缓存状态，发现文档更新时只刷新真正变化的页面 */
+async function checkDocUpdate() {
+    if (!docWatchTimer || !currentPDFKey) return;
+    if ($('reader').classList.contains('hidden')) return; // 已离开阅读器
+
+    let status;
+    try {
+        status = await apiJSON(`/api/pdfs/${currentPDFKey}/cache`);
+    } catch (e) {
+        return; // 网络抖动等，下次轮询再试
+    }
+    // 请求返回时用户可能已经离开阅读器
+    if (!docWatchTimer || $('reader').classList.contains('hidden')) return;
+
+    // 页数变化（文档中插入或删除了页面）：首次轮询也要校正
+    if (status.total > 0 && status.total !== pageCount) {
+        pageCount = status.total;
+        $('page-total').textContent = pageCount;
+        $('page-input').max = pageCount;
+        if (currentPage > pageCount) currentPage = pageCount;
+        $('next-btn').disabled = currentPage >= pageCount;
+    }
+
+    const version = status.version || 0;
+    if (docCacheVersion === null) { docCacheVersion = version; return; } // 首次只记录基线
+    if (version === docCacheVersion) return;
+    docCacheVersion = version;
+
+    // changed_pages 为空表示变化范围未知（例如整份被动缓存被清除），此时刷新当前页
+    const changed = Array.isArray(status.changed_pages) ? status.changed_pages : [];
+    if (changed.length === 0 || changed.indexOf(currentPage) !== -1) {
+        refreshCurrentPage(version);
+        showToast('文档已更新');
+    }
+}
+
+/** 强制重新加载当前页（保留缩放和阅读位置），bust 用于绕过浏览器缓存 */
+function refreshCurrentPage(bust) {
+    const url = pageURL(currentPage, bust);
+    const myID = ++requestID; // 使正在进行的加载请求失效
+    const loader = $('page-loader');
+
+    preloadedPages.clear();
+    loader.classList.remove('hidden');
+    loader.querySelector('span').textContent = '更新中...';
+
+    const pre = new Image();
+    pre.onload = () => {
+        if (myID !== requestID) return;
+        preloadedPages.add(url);
+        $('page-base').src = url;
+        loader.classList.add('hidden');
+    };
+    pre.onerror = () => {
+        if (myID !== requestID) return;
+        loader.classList.add('hidden');
+        showToast('页面加载失败');
+    };
+    pre.src = url;
+}
+
 // ===== 阅读器 =====
 
 /**
@@ -410,6 +517,7 @@ function showReader(key, page) {
     resetZoom();
     updateJumpButtons();
     loadPage(currentPage, 'fade');
+    startDocWatch(); // 监视文档更新（只刷新变化的页面）
 }
 
 /** 更新阅读器头部的缓存按钮状态 */
@@ -432,7 +540,7 @@ function updatePinButton(pdf) {
  * 2. preloadedPages 集合：已加载的页面 URL 被记录，命中时跳过 loader 动画
  * 3. 预加载：延迟 200ms 后预加载相邻页面，若用户已翻走则取消
  */
-function loadPage(page, direction) {
+function loadPage(page, direction, bust) {
     if (page < 1 || page > pageCount) return;
     const myID = ++requestID; // 本次加载的唯一标识
     const isSequential = direction === 'next' || direction === 'prev';
@@ -450,7 +558,7 @@ function loadPage(page, direction) {
     if (isSequential) checkJumpRange();
     updateJumpButtons();
 
-    const url = pageURL(page);
+    const url = pageURL(page, bust);
     const isPreloaded = preloadedPages.has(url);
 
     // 根据导航方式选择加载策略

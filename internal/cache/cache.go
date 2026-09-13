@@ -4,53 +4,67 @@
 //   - 被动缓存（Passive Cache）：未标记的PDF，页面在首次访问时按需渲染，按LRU策略淘汰
 //
 // 缓存目录结构：
-//   {cache_dir}/{cache_key}/p0001.jpg   <- 第1页的JPEG图片
-//   {cache_dir}/{cache_key}/p0002.jpg   <- 第2页
-//   {cache_dir}/{cache_key}.tmp/        <- 全量渲染时的临时目录
-//   {cache_dir}/{cache_key}.old/        <- 旧缓存（渲染完成后被删除）
+//
+//	{cache_dir}/{cache_key}/p0001.jpg   <- 第1页的JPEG图片
+//	{cache_dir}/{cache_key}/p0002.jpg   <- 第2页
+//	{cache_dir}/{cache_key}.tmp/        <- 全量渲染时的临时目录
+//	{cache_dir}/{cache_key}.old/        <- 旧缓存（渲染完成后被删除）
 //
 // cache_key 是PDF文件绝对路径的SHA256哈希前16位，即使数据库重建也不会冲突
 package cache
 
 import (
+	"crypto/sha256"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"note-web/internal/config"
 	"note-web/internal/db"
+	"note-web/internal/models"
 	"note-web/internal/renderer"
 )
 
+// pdfRenderer 是缓存管理器需要的渲染能力集合。
+// 抽成接口便于测试时替换真实的外部命令渲染器。
+type pdfRenderer interface {
+	GetPDFInfo(pdfPath string) (*renderer.PDFInfo, error)
+	RenderPage(pdfPath string, pageNum int, outputPrefix string) (string, error)
+	RenderThumbnail(pdfPath string, pageNum int, outputPrefix string) (string, error)
+}
+
 // Manager 管理PDF页面缓存的生命周期
 type Manager struct {
-	db       *db.Database     // 数据库实例
-	renderer *renderer.Renderer // 渲染器
-	cacheDir string           // 缓存根目录
+	db       *db.Database // 数据库实例
+	renderer pdfRenderer  // 渲染器
+	cacheDir string       // 缓存根目录
 
-	maxPassiveSize int64          // 被动缓存最大磁盘占用（字节）
-	renderSem      chan struct{}  // 渲染并发信号量（限制同时运行的pdftoppm进程数）
+	maxPassiveSize int64         // 被动缓存最大磁盘占用（字节）
+	renderSem      chan struct{} // 渲染并发信号量（限制同时运行的pdftoppm进程数）
 
-	renderQueue  chan int64       // 主动缓存渲染队列（PDF ID）
-	queuedRenders map[int64]bool  // 去重集合：记录哪些PDF已在队列中
-	queueMu       sync.Mutex      // 保护 queuedRenders 的互斥锁
+	renderQueue   chan int64     // 主动缓存渲染队列（PDF ID）
+	queuedRenders map[int64]bool // 去重集合：记录哪些PDF已在队列中
+	queueMu       sync.Mutex     // 保护 queuedRenders 的互斥锁
 
-	stopCh chan struct{}          // 停止信号通道
+	stopCh chan struct{} // 停止信号通道
 }
 
 // New 创建缓存管理器实例
-func New(database *db.Database, r *renderer.Renderer, cfg *config.Config) *Manager {
+func New(database *db.Database, r pdfRenderer, cfg *config.Config) *Manager {
 	m := &Manager{
 		db:             database,
 		renderer:       r,
 		cacheDir:       cfg.CacheDir,
 		maxPassiveSize: int64(cfg.PassiveCache.MaxSizeMB) * 1024 * 1024,
 		renderSem:      make(chan struct{}, cfg.ActiveCache.RenderConcurrency), // 信号量大小 = 并发渲染数
-		renderQueue:    make(chan int64, 100), // 队列缓冲 100 个渲染任务
+		renderQueue:    make(chan int64, 100),                                  // 队列缓冲 100 个渲染任务
 		queuedRenders:  make(map[int64]bool),
 		stopCh:         make(chan struct{}),
 	}
@@ -80,6 +94,65 @@ func fileExists(path string) bool {
 	return err == nil
 }
 
+func (m *Manager) refreshPDFMetadataIfChanged(pdf *models.PDF) (*models.PDF, error) {
+	stat, err := os.Lstat(pdf.Path)
+	if err != nil {
+		return nil, err
+	}
+	if stat.Mode()&os.ModeSymlink != 0 {
+		return nil, fmt.Errorf("PDF path is a symlink")
+	}
+
+	mtime := stat.ModTime().Unix()
+	if pdf.FileMtime == mtime && pdf.FileSize == stat.Size() {
+		return pdf, nil
+	}
+
+	info, err := m.renderer.GetPDFInfo(pdf.Path)
+	if err != nil {
+		return nil, err
+	}
+	if err := m.db.UpdatePDFMetadata(pdf.ID, info.Title, info.PageCount, stat.Size(), mtime); err != nil {
+		return nil, err
+	}
+
+	if pdf.Pinned {
+		m.QueueRender(pdf.ID)
+	} else if err := m.invalidatePDFCache(pdf); err != nil {
+		return nil, err
+	}
+
+	return m.db.GetPDF(pdf.ID)
+}
+
+// InvalidatePDF 删除某个 PDF 已生成的页面和缩略图缓存。
+func (m *Manager) InvalidatePDF(pdfID int64) error {
+	pdf, err := m.db.GetPDF(pdfID)
+	if err != nil {
+		return err
+	}
+	return m.invalidatePDFCache(pdf)
+}
+
+func (m *Manager) invalidatePDFCache(pdf *models.PDF) error {
+	ck := pdf.CacheKey
+	for _, dir := range []string{
+		m.pdfDir(ck),
+		filepath.Join(m.cacheDir, ck+".tmp"),
+		filepath.Join(m.cacheDir, ck+".old"),
+	} {
+		if err := os.RemoveAll(dir); err != nil {
+			return err
+		}
+	}
+	if err := m.db.ClearCacheStats(pdf.ID); err != nil {
+		return err
+	}
+	// 被动缓存整份失效时无法得知具体页码，记录为“范围未知”，
+	// 前端会因此刷新当前页，其余页面在访问时按需重新渲染。
+	return m.db.RecordCacheChange(pdf.ID, nil)
+}
+
 // GetPage 获取指定页面的JPEG图片路径（按需渲染）
 // 这是用户请求页面时的核心方法：
 // 1. 先检查缓存是否已有此页（命中则直接返回）
@@ -93,6 +166,10 @@ func (m *Manager) GetPage(pdfID int64, pageNum int) (string, error) {
 	}
 	if pdf.Deleted {
 		return "", fmt.Errorf("PDF not found")
+	}
+	pdf, err = m.refreshPDFMetadataIfChanged(pdf)
+	if err != nil {
+		return "", fmt.Errorf("refresh PDF metadata: %w", err)
 	}
 	if pageNum < 1 || pageNum > pdf.PageCount {
 		return "", fmt.Errorf("page %d out of range (1-%d)", pageNum, pdf.PageCount)
@@ -141,6 +218,10 @@ func (m *Manager) GetThumbnail(pdfID int64, pageNum int) (string, error) {
 	}
 	if pdf.Deleted {
 		return "", fmt.Errorf("PDF not found")
+	}
+	pdf, err = m.refreshPDFMetadataIfChanged(pdf)
+	if err != nil {
+		return "", fmt.Errorf("refresh PDF metadata: %w", err)
 	}
 	if pageNum < 1 || pageNum > pdf.PageCount {
 		return "", fmt.Errorf("page %d out of range (1-%d)", pageNum, pdf.PageCount)
@@ -272,13 +353,8 @@ func (m *Manager) StartActiveCacheWorker() {
 	}()
 }
 
-// RenderAllPages 全量渲染PDF的所有页面到缓存
-// 这是主动缓存的核心方法，流程：
-// 1. 在临时目录 {cache_key}.tmp/ 中逐页渲染
-// 2. 渲染完成后，原子替换：旧目录改名为 .old，临时目录改名为正式目录，删除 .old
-// 3. 更新数据库缓存统计
-//
-// 原子替换确保渲染期间旧缓存继续可用，不受影响
+// RenderAllPages 渲染主动缓存。
+// 已有缓存时会逐页比较，只替换内容发生变化的页面，并移除对应缩略图。
 func (m *Manager) RenderAllPages(pdfID int64) error {
 	pdf, err := m.db.GetPDF(pdfID)
 	if err != nil {
@@ -294,80 +370,251 @@ func (m *Manager) RenderAllPages(pdfID int64) error {
 	m.db.SetRebuilding(pdfID, true)
 	defer m.db.SetRebuilding(pdfID, false)
 
-	// 创建临时目录
 	ck := pdf.CacheKey
 	tmpDir := filepath.Join(m.cacheDir, ck+".tmp")
 	os.RemoveAll(tmpDir)
 	if err := os.MkdirAll(tmpDir, 0755); err != nil {
 		return fmt.Errorf("create tmp dir: %w", err)
 	}
+	defer os.RemoveAll(tmpDir)
+	if err := os.MkdirAll(m.pdfDir(ck), 0755); err != nil {
+		return fmt.Errorf("create cache dir: %w", err)
+	}
 
-	renderedCount := 0
-	totalSize := int64(0)
+	processedCount := 0
+	changedPages := []int{}
+	// 首次填充缓存（此前没有任何缓存页面）不算“文档更新”，无需通知前端刷新
+	notifyChange := pdf.CachedPages > 0
+	// 渲染完成后的缓存统计（只统计最终目录中真实存在的页面文件）
+	availablePages := 0
+	cachedBytes := int64(0)
 
-	// 逐页渲染到临时目录
 	for page := 1; page <= pdf.PageCount; page++ {
 		// 检查是否收到停止信号
 		select {
 		case <-m.stopCh:
-			os.RemoveAll(tmpDir)
 			return fmt.Errorf("render interrupted")
 		default:
 		}
 
-		// 获取渲染信号量
-		m.renderSem <- struct{}{}
-
+		finalPath := m.pagePath(ck, page)
+		thumbPath := m.thumbPath(ck, page)
 		outputPrefix := filepath.Join(tmpDir, fmt.Sprintf("p%04d", page))
+		tmpPath := outputPrefix + ".jpg"
+
+		m.renderSem <- struct{}{}
 		_, err := m.renderer.RenderPage(pdf.Path, page, outputPrefix)
 		<-m.renderSem
 
+		if err == nil && !fileExists(tmpPath) {
+			err = fmt.Errorf("renderer produced no output")
+		}
 		if err != nil {
 			log.Printf("  page %d failed: %v", page, err)
-			continue // 单页失败不影响其他页
+			os.Remove(finalPath)
+			os.Remove(thumbPath)
+			changedPages = append(changedPages, page)
+			continue
 		}
 
-		renderedCount++
-		if stat, err := os.Stat(outputPrefix + ".jpg"); err == nil {
-			totalSize += stat.Size()
+		same, err := filesEqual(finalPath, tmpPath)
+		if err != nil {
+			log.Printf("  page %d compare failed: %v", page, err)
+		}
+		if same {
+			os.Remove(tmpPath)
+		} else {
+			if err := replaceFile(tmpPath, finalPath); err != nil {
+				return fmt.Errorf("replace page %d: %w", page, err)
+			}
+			os.Remove(thumbPath)
+			changedPages = append(changedPages, page)
+		}
+
+		processedCount++
+		if stat, err := os.Stat(finalPath); err == nil {
+			availablePages++
+			cachedBytes += stat.Size()
 		}
 
 		// 每10页更新一次进度（前端可查询）
 		if page%10 == 0 {
-			m.db.UpdateCacheStats(pdfID, renderedCount, totalSize)
+			m.db.UpdateCacheStats(pdfID, availablePages, cachedBytes)
 			log.Printf("  PDF %d: %d/%d pages rendered", pdfID, page, pdf.PageCount)
 		}
 	}
 
-	// 原子替换：旧目录 -> .old，临时目录 -> 正式目录，删除 .old
-	finalDir := m.pdfDir(ck)
-	oldDir := filepath.Join(m.cacheDir, ck+".old")
-
-	os.RemoveAll(oldDir)
-	if fileExists(finalDir) {
-		os.Rename(finalDir, oldDir) // 旧目录改名
+	if removed, err := m.removePagesAfter(ck, pdf.PageCount); err != nil {
+		log.Printf("failed to remove stale pages for PDF %d: %v", pdfID, err)
+	} else if len(removed) > 0 {
+		changedPages = append(changedPages, removed...)
 	}
-	if err := os.Rename(tmpDir, finalDir); err != nil {
-		// 替换失败，尝试恢复旧目录
-		log.Printf("swap failed, attempting recovery: %v", err)
-		if fileExists(oldDir) {
-			os.Rename(oldDir, finalDir)
-		}
-		return fmt.Errorf("swap failed: %w", err)
-	}
-	os.RemoveAll(oldDir) // 清理旧目录
 
-	// 如果PDF仍然被pinned（可能渲染期间被取消），标记为主动缓存
+	changedPages = sortUniqueInts(changedPages)
+
 	current, err := m.db.GetPDF(pdfID)
 	if err == nil && current.Pinned {
-		m.db.SetCacheActive(pdfID, true)
+		m.db.SetCacheActive(pdfID, availablePages >= current.PageCount)
 	}
-	m.db.UpdateCacheStats(pdfID, renderedCount, totalSize)
+	m.db.UpdateCacheStats(pdfID, availablePages, cachedBytes)
+	if len(changedPages) > 0 && notifyChange {
+		// 记录本次真正发生变化的页码：前端只刷新这些页面，而不是整份文档
+		if err := m.db.RecordCacheChange(pdfID, changedPages); err != nil {
+			log.Printf("failed to record cache change for PDF %d: %v", pdfID, err)
+		}
+	}
 
-	log.Printf("completed full render for PDF %d: %d/%d pages, %.1fMB",
-		pdfID, renderedCount, pdf.PageCount, float64(totalSize)/(1024*1024))
+	log.Printf("completed render for PDF %d: %d/%d pages available, %.1fMB, changed pages: %s",
+		pdfID, availablePages, pdf.PageCount, float64(cachedBytes)/(1024*1024), formatPageList(changedPages))
+
+	if processedCount == 0 && pdf.PageCount > 0 {
+		return fmt.Errorf("no pages rendered")
+	}
 
 	return nil
+}
+
+func (m *Manager) removePagesAfter(cacheKey string, pageCount int) ([]int, error) {
+	dir := m.pdfDir(cacheKey)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	removedPages := []int{}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		page, ok := pageNumberFromCacheName(entry.Name())
+		if !ok || page <= pageCount {
+			continue
+		}
+		if err := os.Remove(filepath.Join(dir, entry.Name())); err != nil && !os.IsNotExist(err) {
+			return removedPages, err
+		}
+		removedPages = append(removedPages, page)
+	}
+	return removedPages, nil
+}
+
+func pageNumberFromCacheName(name string) (int, bool) {
+	if len(name) != len("p0001.jpg") || !strings.HasSuffix(name, ".jpg") {
+		return 0, false
+	}
+	if name[0] != 'p' && name[0] != 't' {
+		return 0, false
+	}
+	page, err := strconv.Atoi(name[1:5])
+	if err != nil {
+		return 0, false
+	}
+	return page, true
+}
+
+func filesEqual(left, right string) (bool, error) {
+	leftInfo, err := os.Stat(left)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	rightInfo, err := os.Stat(right)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	if leftInfo.Size() != rightInfo.Size() {
+		return false, nil
+	}
+
+	leftHash, err := fileHash(left)
+	if err != nil {
+		return false, err
+	}
+	rightHash, err := fileHash(right)
+	if err != nil {
+		return false, err
+	}
+	return leftHash == rightHash, nil
+}
+
+func fileHash(path string) ([32]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return [32]byte{}, err
+	}
+	defer f.Close()
+
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return [32]byte{}, err
+	}
+	var sum [32]byte
+	copy(sum[:], h.Sum(nil))
+	return sum, nil
+}
+
+func replaceFile(src, dst string) error {
+	if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
+		return err
+	}
+
+	backup := dst + ".old"
+	os.Remove(backup)
+	if fileExists(dst) {
+		if err := os.Rename(dst, backup); err != nil {
+			return err
+		}
+	}
+	if err := os.Rename(src, dst); err != nil {
+		if fileExists(backup) {
+			os.Rename(backup, dst)
+		}
+		return err
+	}
+	os.Remove(backup)
+	return nil
+}
+
+func formatPageList(pages []int) string {
+	if len(pages) == 0 {
+		return "none"
+	}
+	limit := len(pages)
+	if limit > 20 {
+		limit = 20
+	}
+	parts := make([]string, 0, limit+1)
+	for i := 0; i < limit; i++ {
+		parts = append(parts, strconv.Itoa(pages[i]))
+	}
+	if len(pages) > limit {
+		parts = append(parts, fmt.Sprintf("+%d more", len(pages)-limit))
+	}
+	return strings.Join(parts, ",")
+}
+
+// sortUniqueInts 去重并升序排序页码列表
+// （缩略图和页面文件都会命中同一页码，需要合并）
+func sortUniqueInts(values []int) []int {
+	if len(values) == 0 {
+		return nil
+	}
+	sort.Ints(values)
+	unique := values[:1]
+	for _, v := range values[1:] {
+		if v != unique[len(unique)-1] {
+			unique = append(unique, v)
+		}
+	}
+	return unique
 }
 
 // StartEviction 启动被动缓存LRU淘汰器
@@ -424,8 +671,8 @@ func (m *Manager) evict() {
 
 		pdf := pdfs[0]
 		dir := m.pdfDir(pdf.CacheKey)
-		os.RemoveAll(dir)              // 删除缓存文件
-		m.db.ClearCacheStats(pdf.ID)   // 清除数据库中的缓存统计
+		os.RemoveAll(dir)            // 删除缓存文件
+		m.db.ClearCacheStats(pdf.ID) // 清除数据库中的缓存统计
 
 		size -= pdf.CacheSize
 		log.Printf("evicted PDF %d (%s), freed %.1fMB", pdf.ID, pdf.Title, float64(pdf.CacheSize)/(1024*1024))

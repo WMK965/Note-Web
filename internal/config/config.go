@@ -15,6 +15,7 @@ import (
 // Config 是顶层配置结构，包含所有子配置
 type Config struct {
 	Server       ServerConfig       `yaml:"server"`        // HTTP 服务器配置
+	Proxy        ProxyConfig        `yaml:"proxy"`         // 反向代理访问配置
 	PDF          PDFConfig          `yaml:"pdf"`           // PDF 目录扫描配置
 	Render       RenderConfig       `yaml:"render"`        // 页面渲染参数
 	ActiveCache  ActiveCacheConfig  `yaml:"active_cache"`  // 主动缓存配置（pinned PDF 预渲染）
@@ -27,6 +28,12 @@ type Config struct {
 type ServerConfig struct {
 	Host string `yaml:"host"` // 监听地址，默认 "0.0.0.0"
 	Port int    `yaml:"port"` // 监听端口，默认 8080
+}
+
+// ProxyConfig 是可选的子路径代理配置
+// BasePath 设为 "/proxy-index" 后，会额外暴露 /proxy-index/ 和 /proxy-index/api/*
+type ProxyConfig struct {
+	BasePath string `yaml:"base_path"`
 }
 
 // PDFConfig 是 PDF 目录扫描配置
@@ -83,13 +90,17 @@ type DatabaseConfig struct {
 
 // Default 返回默认配置
 // 这些默认值与 Docker 部署的 volume 挂载点对应：
-//   /documents  -> PDF 文件目录（只读挂载）
-//   /data       -> 数据库和缓存目录
+//
+//	/documents  -> PDF 文件目录（只读挂载）
+//	/data       -> 数据库和缓存目录
 func Default() *Config {
 	return &Config{
 		Server: ServerConfig{
 			Host: "0.0.0.0",
 			Port: 8080,
+		},
+		Proxy: ProxyConfig{
+			BasePath: "",
 		},
 		PDF: PDFConfig{
 			Dirs:         []string{"/documents"},
@@ -141,6 +152,27 @@ func (c *Config) Validate() error {
 	if c.Server.Port <= 0 || c.Server.Port > 65535 {
 		return fmt.Errorf("invalid port: %d", c.Server.Port)
 	}
+	// 代理前缀：统一规范化为 "/xxx"；"/" 和空值都表示不启用额外入口
+	basePath := strings.TrimSpace(c.Proxy.BasePath)
+	if basePath != "" {
+		if !strings.HasPrefix(basePath, "/") {
+			return fmt.Errorf("proxy.base_path must start with /")
+		}
+		basePath = "/" + strings.Trim(basePath, "/")
+	}
+	if basePath == "/" {
+		basePath = ""
+	}
+	if basePath != "" {
+		if strings.Contains(basePath, "//") || strings.Contains(basePath, "..") ||
+			strings.ContainsAny(basePath, `\?#`+" ") {
+			return fmt.Errorf("invalid proxy.base_path: %q", basePath)
+		}
+		if basePath == "/api" || strings.HasPrefix(basePath, "/api/") {
+			return fmt.Errorf("proxy.base_path must not overlap /api")
+		}
+	}
+	c.Proxy.BasePath = basePath
 	if len(c.PDF.Dirs) == 0 {
 		return fmt.Errorf("pdf.dirs must not be empty")
 	}
