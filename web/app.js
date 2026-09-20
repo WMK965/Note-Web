@@ -540,6 +540,21 @@ function updatePinButton(pdf) {
 
 // ===== 智能页面加载 =====
 
+const PAGE_SLIDE_DURATION = 200;
+
+/** 先提交动画起始位置，避免浏览器合并样式后直接显示结束位置 */
+function animatePageWrapper(wrapper, fromTransform, toTransform, myID) {
+    wrapper.style.display = '';
+    wrapper.style.transition = 'none';
+    wrapper.style.transform = fromTransform;
+    void wrapper.offsetWidth;
+    requestAnimationFrame(() => {
+        if (myID !== requestID) return;
+        wrapper.style.transition = `transform ${PAGE_SLIDE_DURATION}ms ease-out`;
+        wrapper.style.transform = toTransform;
+    });
+}
+
 /**
  * 加载指定页面，根据导航方式选择不同的加载策略
  * @param {number} page - 目标页码
@@ -554,6 +569,12 @@ function loadPage(page, direction, bust) {
     if (page < 1 || page > pageCount) return;
     const myID = ++requestID; // 本次加载的唯一标识
     const isSequential = direction === 'next' || direction === 'prev';
+    const overlayWrapper = $('overlay-wrapper');
+
+    // 新导航会使旧回调失效，同时也要立即清掉旧动画留下的可见叠加层。
+    overlayWrapper.style.display = 'none';
+    overlayWrapper.style.transition = '';
+    overlayWrapper.style.transform = '';
 
     // 更新 UI 状态
     currentPage = page;
@@ -657,14 +678,7 @@ function slidePage(url, direction, myID, isPreloaded) {
             preloadedPages.add(url);
             loader.classList.add('hidden');
             overlay.src = url;
-            ow.style.display = '';                      // 显示叠加层
-            ow.style.transition = 'none';               // 先禁用动画
-            ow.style.transform = 'translateX(100%)';    // 定位到右侧屏外
-            requestAnimationFrame(() => {
-                if (myID !== requestID) return;
-                ow.style.transition = 'transform 0.2s ease-out'; // 启用动画
-                ow.style.transform = 'translateX(0)';            // 滑入
-            });
+            animatePageWrapper(ow, 'translateX(100%)', 'translateX(0)', myID);
             // 动画结束后：将新页 src 复制到 base，隐藏 overlay
             setTimeout(() => {
                 if (myID !== requestID) return;
@@ -672,7 +686,7 @@ function slidePage(url, direction, myID, isPreloaded) {
                 ow.style.display = 'none';
                 ow.style.transition = '';
                 ow.style.transform = '';
-            }, 220);
+            }, PAGE_SLIDE_DURATION + 20);
         };
         if (isPreloaded) { startSlide(); }
         else {
@@ -686,27 +700,20 @@ function slidePage(url, direction, myID, isPreloaded) {
     } else {
         // === 向后翻页：当前页向右滑出，露出上一页 ===
         overlay.src = base.src; // 将当前页复制到叠加层
-        ow.style.display = '';
-        ow.style.transition = 'none';
-        ow.style.transform = 'translateX(0)'; // 叠加层覆盖在 base 之上
 
         const startSlide = () => {
             if (myID !== requestID) return;
             preloadedPages.add(url);
             loader.classList.add('hidden');
             base.src = url; // 将上一页加载到底层（被 overlay 遮挡，不可见）
-            requestAnimationFrame(() => {
-                if (myID !== requestID) return;
-                ow.style.transition = 'transform 0.2s ease-out';
-                ow.style.transform = 'translateX(100%)'; // 叠加层向右滑出
-            });
+            animatePageWrapper(ow, 'translateX(0)', 'translateX(100%)', myID);
             // 动画结束后隐藏叠加层
             setTimeout(() => {
                 if (myID !== requestID) return;
                 ow.style.display = 'none';
                 ow.style.transition = '';
                 ow.style.transform = '';
-            }, 220);
+            }, PAGE_SLIDE_DURATION + 20);
         };
         if (isPreloaded) { startSlide(); }
         else {
@@ -817,8 +824,14 @@ document.addEventListener('keydown', e => {
     if (e.isComposing) return; // IME 组字中不处理快捷键
     if ($('reader').classList.contains('hidden')) return;
 
-    if (e.key === 'ArrowLeft') goPrev();
-    if (e.key === 'ArrowRight') goNext();
+    if (e.key === 'ArrowLeft' || e.key === 'PageUp') {
+        e.preventDefault();
+        goPrev();
+    }
+    if (e.key === 'ArrowRight' || e.key === 'PageDown') {
+        e.preventDefault();
+        goNext();
+    }
 
     // 按 \ 键打开/关闭目录侧边栏
     if (e.code === 'Backslash') {
@@ -887,6 +900,12 @@ function applyTransform() {
 
 /** 重置缩放和平移到初始状态（zoom=1, pan=0） */
 function resetZoom() {
+    if (horizontalZoomFrame !== null) {
+        cancelAnimationFrame(horizontalZoomFrame);
+        horizontalZoomFrame = null;
+    }
+    horizontalZoomDelta = 0;
+    horizontalZoomFocal = null;
     zoom = 1; panX = 0; panY = 0;
     $('page-base').style.transform = '';
     $('page-base').classList.remove('smooth');
@@ -988,31 +1007,117 @@ $('page-area').addEventListener('touchend', e => {
 }, { passive: true });
 
 // ===== 滚轮事件：横向缩放 + 竖向翻页 + Ctrl缩放 =====
-let lastScrollPage = 0; // 竖向滚轮翻页节流时间戳
+const HORIZONTAL_WHEEL_THRESHOLD = 40;
+const HORIZONTAL_WHEEL_ZOOM_STEP = 1.07;
+const HORIZONTAL_CONTINUOUS_SPEED = 1.2;
+const CTRL_WHEEL_ZOOM_STEP = 0.055;
+const VERTICAL_WHEEL_THRESHOLD = 80;
+const WHEEL_GESTURE_END_DELAY = 180;
+let horizontalWheelDelta = 0;
+let horizontalWheelResetTimer = null;
+let horizontalZoomDelta = 0;
+let horizontalZoomFocal = null;
+let horizontalZoomFrame = null;
+let verticalWheelDelta = 0;
+let verticalWheelHandled = false;
+let verticalWheelResetTimer = null;
+
+/** 将不同 deltaMode 的滚轮输入统一换算为像素 */
+function normalizeWheelDelta(delta, deltaMode, pageSize) {
+    if (deltaMode === WheelEvent.DOM_DELTA_LINE) return delta * 16;
+    if (deltaMode === WheelEvent.DOM_DELTA_PAGE) return delta * pageSize;
+    return delta;
+}
+
+/** 方向改变时丢弃上一方向的累计量，避免左右/上下抵消后误触 */
+function accumulateWheelDelta(total, delta) {
+    if (total !== 0 && Math.sign(total) !== Math.sign(delta)) total = 0;
+    return total + delta;
+}
+
+function scheduleHorizontalWheelReset() {
+    clearTimeout(horizontalWheelResetTimer);
+    horizontalWheelResetTimer = setTimeout(() => { horizontalWheelDelta = 0; }, WHEEL_GESTURE_END_DELAY);
+}
+
+function scheduleVerticalWheelReset() {
+    clearTimeout(verticalWheelResetTimer);
+    verticalWheelResetTimer = setTimeout(() => {
+        verticalWheelDelta = 0;
+        verticalWheelHandled = false;
+    }, WHEEL_GESTURE_END_DELAY);
+}
+
+/** 合并同一帧内的横滚轮事件，避免连续重启 CSS transition 造成拖滞 */
+function queueHorizontalZoom(delta, focal) {
+    horizontalZoomDelta = accumulateWheelDelta(horizontalZoomDelta, delta);
+    horizontalZoomFocal = focal;
+    if (horizontalZoomFrame !== null) return;
+
+    horizontalZoomFrame = requestAnimationFrame(() => {
+        const pendingDelta = horizontalZoomDelta;
+        const pendingFocal = horizontalZoomFocal;
+        horizontalZoomDelta = 0;
+        horizontalZoomFocal = null;
+        horizontalZoomFrame = null;
+        if (!pendingDelta || !pendingFocal) return;
+
+        const steps = Math.abs(pendingDelta) / HORIZONTAL_WHEEL_THRESHOLD * HORIZONTAL_CONTINUOUS_SPEED;
+        const continuousFactor = Math.pow(HORIZONTAL_WHEEL_ZOOM_STEP, steps);
+        const factor = pendingDelta > 0 ? continuousFactor : 1 / continuousFactor;
+        $('page-base').classList.remove('smooth');
+        zoomAt(pendingFocal.x, pendingFocal.y, zoom * factor);
+    });
+}
 
 $('page-area').addEventListener('wheel', e => {
-    if (e.deltaX !== 0) {
-        // 横向滚轮 -> 缩放（灵敏度降至原来的1/3：1.05/0.95 替代 1.15/0.87）
+    const area = $('page-area');
+    const deltaX = normalizeWheelDelta(e.deltaX, e.deltaMode, area.clientWidth);
+    const deltaY = normalizeWheelDelta(e.deltaY, e.deltaMode, area.clientHeight);
+
+    if (e.ctrlKey && deltaY !== 0) {
+        // Ctrl + 竖向滚轮 -> 缩放
         e.preventDefault();
         const focal = getFocalPoint(e.clientX, e.clientY);
-        const factor = e.deltaX > 0 ? 1.05 : 0.95;
+        const factor = deltaY > 0 ? 1 - CTRL_WHEEL_ZOOM_STEP : 1 + CTRL_WHEEL_ZOOM_STEP;
         smoothZoomAt(focal.x, focal.y, zoom * factor);
-    } else if (e.deltaY !== 0) {
-        if (e.ctrlKey) {
-            // Ctrl + 竖向滚轮 -> 缩放
-            e.preventDefault();
-            const focal = getFocalPoint(e.clientX, e.clientY);
-            const factor = e.deltaY > 0 ? 0.95 : 1.05;
+        return;
+    }
+
+    // Shift + 竖滚轮也按横向输入处理，兼容没有独立横滚轮的桌面设备。
+    const horizontalDelta = deltaX !== 0 ? deltaX : (e.shiftKey ? deltaY : 0);
+    const verticalDelta = e.shiftKey && deltaX === 0 ? 0 : deltaY;
+    if (horizontalDelta !== 0 && Math.abs(horizontalDelta) > Math.abs(verticalDelta)) {
+        e.preventDefault();
+        const focal = getFocalPoint(e.clientX, e.clientY);
+        let factor;
+        if (zoom === 1) {
+            horizontalWheelDelta = accumulateWheelDelta(horizontalWheelDelta, horizontalDelta);
+            scheduleHorizontalWheelReset();
+            if (Math.abs(horizontalWheelDelta) < HORIZONTAL_WHEEL_THRESHOLD) return;
+            factor = horizontalWheelDelta > 0 ? HORIZONTAL_WHEEL_ZOOM_STEP : 1 / HORIZONTAL_WHEEL_ZOOM_STEP;
+            horizontalWheelDelta = 0;
             smoothZoomAt(focal.x, focal.y, zoom * factor);
-        } else if (zoom === 1) {
-            // 竖向滚轮 -> 翻页（300ms节流，防止滚轮连续触发）
-            e.preventDefault();
-            const now = Date.now();
-            if (now - lastScrollPage < 300) return;
-            lastScrollPage = now;
-            if (e.deltaY > 0) goNext();
-            else goPrev();
+        } else {
+            // 进入放大状态后取消安全阈值，并在动画帧内合并输入。
+            horizontalWheelDelta = 0;
+            queueHorizontalZoom(horizontalDelta, focal);
         }
+        return;
+    }
+
+    if (verticalDelta !== 0) {
+        e.preventDefault();
+        verticalWheelDelta = accumulateWheelDelta(verticalWheelDelta, verticalDelta);
+        scheduleVerticalWheelReset();
+        if (verticalWheelHandled || Math.abs(verticalWheelDelta) < VERTICAL_WHEEL_THRESHOLD) return;
+
+        verticalWheelHandled = true;
+        verticalWheelDelta = 0;
+        // 翻页会重置缩放；在第一页/最后一页没有可翻页时也保持同样的归位行为。
+        if (zoom > 1) resetZoom();
+        if (verticalDelta > 0) goNext();
+        else goPrev();
     }
 }, { passive: false });
 
@@ -1214,7 +1319,7 @@ function bindMarkEvents(list) {
             const page = parseInt(el.dataset.page);
             if (page > 0) {
                 closeMarksSidebar();
-                setTimeout(() => loadPage(page, 'fade'), 100);
+                setTimeout(() => jumpToPage(page), 100);
             }
         });
     });
