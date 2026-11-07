@@ -75,7 +75,7 @@ type ActiveCacheConfig struct {
 // RenderConfig 是页面渲染参数
 type RenderConfig struct {
 	JpegQuality int `yaml:"jpeg_quality"` // JPEG 压缩质量（1-100），默认 80
-	ScaleWidth  int `yaml:"scale_width"`  // 渲染宽度（像素），默认 1080
+	ScaleWidth  int `yaml:"scale_width"`  // 页面短边目标宽度（像素），默认 1080
 	ThumbWidth  int `yaml:"thumb_width"`  // 缩略图宽度（像素），默认 200
 }
 

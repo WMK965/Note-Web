@@ -46,6 +46,7 @@ cache:
   # 页面渲染参数
   render:
     jpeg_quality: 80
+    # 页面短边渲染宽度；横页与竖页都会把短边缩放到该像素数
     scale_width: 1080
     thumb_width: 200
 

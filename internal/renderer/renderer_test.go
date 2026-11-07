@@ -1,9 +1,121 @@
 package renderer
 
 import (
+	"bytes"
+	"fmt"
+	"image/jpeg"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
+
+	"note-web/internal/config"
 )
+
+func TestPageScaleArgsUsesShortEdge(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "page-sizes.pdf")
+	pdfData := pageSizePDF()
+	if err := os.WriteFile(path, pdfData, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	r := &Renderer{scaleShortEdge: 1080}
+	tests := []struct {
+		page       int
+		wantX      int
+		wantY      int
+		wantWidth  float64
+		wantHeight float64
+	}{
+		{page: 1, wantX: -1, wantY: 1080, wantWidth: 792, wantHeight: 612},
+		{page: 2, wantX: 1080, wantY: -1, wantWidth: 612, wantHeight: 792},
+		{page: 3, wantX: 1080, wantY: -1, wantWidth: 612, wantHeight: 792},
+	}
+
+	for _, tt := range tests {
+		width, height, ok := readPageBoxSize(path, tt.page)
+		if !ok || width != tt.wantWidth || height != tt.wantHeight {
+			t.Errorf("page %d size = %.0fx%.0f, ok=%v; want %.0fx%.0f",
+				tt.page, width, height, ok, tt.wantWidth, tt.wantHeight)
+		}
+		gotX, gotY := r.pageScaleArgs(path, tt.page)
+		if gotX != tt.wantX || gotY != tt.wantY {
+			t.Errorf("page %d scale args = (%d, %d), want (%d, %d)",
+				tt.page, gotX, gotY, tt.wantX, tt.wantY)
+		}
+	}
+}
+
+func TestRenderPageScalesShortEdgeWithPdftoppm(t *testing.T) {
+	if _, err := exec.LookPath("pdftoppm"); err != nil {
+		t.Skip("pdftoppm is not installed")
+	}
+
+	dir := t.TempDir()
+	pdfPath := filepath.Join(dir, "page-sizes.pdf")
+	if err := os.WriteFile(pdfPath, pageSizePDF(), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	r := New(config.RenderConfig{JpegQuality: 80, ScaleWidth: 1080})
+	tests := []struct {
+		page          int
+		wantLandscape bool
+	}{
+		{page: 1, wantLandscape: true},
+		{page: 2, wantLandscape: false},
+		{page: 3, wantLandscape: true},
+	}
+
+	for _, tt := range tests {
+		outputPrefix := filepath.Join(dir, fmt.Sprintf("page-%d", tt.page))
+		output, err := r.RenderPage(pdfPath, tt.page, outputPrefix)
+		if err != nil {
+			t.Fatalf("render page %d: %v", tt.page, err)
+		}
+		f, err := os.Open(output)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := jpeg.DecodeConfig(f)
+		f.Close()
+		if err != nil {
+			t.Fatalf("decode page %d: %v", tt.page, err)
+		}
+		shortEdge := min(cfg.Width, cfg.Height)
+		if shortEdge != 1080 || (cfg.Width > cfg.Height) != tt.wantLandscape {
+			t.Errorf("page %d JPEG size = %dx%d, want %s page with 1080px short edge",
+				tt.page, cfg.Width, cfg.Height, map[bool]string{true: "landscape", false: "portrait"}[tt.wantLandscape])
+		}
+	}
+}
+
+func pageSizePDF() []byte {
+	objects := []string{
+		"<< /Type /Catalog /Pages 2 0 R >>",
+		"<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R] /Count 3 /MediaBox [0 0 612 792] >>",
+		"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 792 612] >>",
+		"<< /Type /Page /Parent 2 0 R >>",
+		"<< /Type /Page /Parent 2 0 R /Rotate 90 >>",
+	}
+
+	var buf bytes.Buffer
+	buf.WriteString("%PDF-1.4\n")
+	offsets := make([]int, len(objects))
+	for i, object := range objects {
+		offsets[i] = buf.Len()
+		fmt.Fprintf(&buf, "%d 0 obj\n%s\nendobj\n", i+1, object)
+	}
+	xrefOffset := buf.Len()
+	fmt.Fprintf(&buf, "xref\n0 %d\n", len(objects)+1)
+	buf.WriteString("0000000000 65535 f \n")
+	for _, offset := range offsets {
+		fmt.Fprintf(&buf, "%010d 00000 n \n", offset)
+	}
+	fmt.Fprintf(&buf, "trailer\n<< /Root 1 0 R /Size %d >>\nstartxref\n%d\n%%%%EOF\n", len(objects)+1, xrefOffset)
+	return buf.Bytes()
+}
 
 // 真实 mutool 1.28 输出（来自《生理学（第十版）》，`mutool show -- x.pdf outline`）
 const mutoolSample = "|	\"封面页\\x00\"	#page=1&zoom=nan,0,-.2800293\n" +

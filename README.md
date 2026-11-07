@@ -113,7 +113,7 @@ go build -o note-web .
 | `cache.dir` | 页面缓存目录 | `/data/cache` |
 | `cache.max_size_mb` | 被动缓存容量上限 | `2048` |
 | `cache.active.*` | 主动缓存并发、变更延迟和轮询间隔 | 见示例 |
-| `cache.render.*` | JPEG 质量、页面宽度和缩略图宽度 | 见示例 |
+| `cache.render.*` | JPEG 质量、页面短边渲染宽度和缩略图宽度 | 见示例 |
 | `database.path` | SQLite 数据库文件 | `/data/note-web.db` |
 
 时长支持 `s`、`m`、`h`、`d`，例如 `30s`、`1h30m`、`7d`；大小支持 `K`、`M`、`G` 后缀（按 1024 进制计算）。

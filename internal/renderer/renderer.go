@@ -31,32 +31,33 @@ const (
 )
 
 type Renderer struct {
-	jpegQuality int
-	scaleWidth  int
-	thumbWidth  int
+	jpegQuality    int
+	scaleShortEdge int
+	thumbWidth     int
 }
 
 func New(cfg config.RenderConfig) *Renderer {
 	return &Renderer{
-		jpegQuality: cfg.JpegQuality,
-		scaleWidth:  cfg.ScaleWidth,
-		thumbWidth:  cfg.ThumbWidth,
+		jpegQuality:    cfg.JpegQuality,
+		scaleShortEdge: cfg.ScaleWidth,
+		thumbWidth:     cfg.ThumbWidth,
 	}
 }
 
 // RenderPage 将PDF的指定页面渲染为JPEG图片
 func (r *Renderer) RenderPage(pdfPath string, pageNum int, outputPrefix string) (string, error) {
-	return r.render(pdfPath, pageNum, outputPrefix, r.scaleWidth, r.jpegQuality)
+	scaleX, scaleY := r.pageScaleArgs(pdfPath, pageNum)
+	return r.render(pdfPath, pageNum, outputPrefix, scaleX, scaleY, r.jpegQuality)
 }
 
 // RenderThumbnail 渲染缩略图
 func (r *Renderer) RenderThumbnail(pdfPath string, pageNum int, outputPrefix string) (string, error) {
-	return r.render(pdfPath, pageNum, outputPrefix, r.thumbWidth, 60)
+	return r.render(pdfPath, pageNum, outputPrefix, r.thumbWidth, -1, 60)
 }
 
 // render 调用 pdftoppm 渲染页面
 // 安全：使用 CommandContext 限制超时（M3），加 -- 防止参数注入（M4）
-func (r *Renderer) render(pdfPath string, pageNum int, outputPrefix string, width int, quality int) (string, error) {
+func (r *Renderer) render(pdfPath string, pageNum int, outputPrefix string, scaleX, scaleY, quality int) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), renderTimeout)
 	defer cancel()
 
@@ -65,8 +66,8 @@ func (r *Renderer) render(pdfPath string, pageNum int, outputPrefix string, widt
 		"-l", strconv.Itoa(pageNum),
 		"-jpeg",
 		"-jpegopt", fmt.Sprintf("quality=%d", quality),
-		"-scale-to-x", strconv.Itoa(width),
-		"-scale-to-y", "-1",
+		"-scale-to-x", strconv.Itoa(scaleX),
+		"-scale-to-y", strconv.Itoa(scaleY),
 		"-singlefile",
 		"--", // 终止选项解析，防止以 - 开头的文件名被当作选项（M4）
 		pdfPath,
@@ -78,6 +79,61 @@ func (r *Renderer) render(pdfPath string, pageNum int, outputPrefix string, widt
 	}
 
 	return outputPrefix + ".jpg", nil
+}
+
+// pageScaleArgs 让 scale_width 表示页面短边长度。
+// pdftoppm 默认使用 MediaBox，且旋转不会改变短边长度，因此直接按原始横竖方向选轴。
+// 无法读取页面尺寸时保持旧的竖页行为。
+func (r *Renderer) pageScaleArgs(pdfPath string, pageNum int) (int, int) {
+	width, height, ok := readPageBoxSize(pdfPath, pageNum)
+	if ok && width > height {
+		return -1, r.scaleShortEdge
+	}
+	return r.scaleShortEdge, -1
+}
+
+func readPageBoxSize(pdfPath string, pageNum int) (width, height float64, ok bool) {
+	f, err := os.Open(pdfPath)
+	if err != nil {
+		return 0, 0, false
+	}
+	defer f.Close()
+
+	reader, err := pdf.NewReader(f, fileSize(pdfPath))
+	if err != nil || pageNum < 1 || pageNum > reader.NumPage() {
+		return 0, 0, false
+	}
+	page := reader.Page(pageNum)
+
+	box := inheritedPageValue(page.V, "MediaBox")
+	if box.Len() < 4 {
+		return 0, 0, false
+	}
+
+	width = absFloat(box.Index(2).Float64() - box.Index(0).Float64())
+	height = absFloat(box.Index(3).Float64() - box.Index(1).Float64())
+	if width <= 0 || height <= 0 {
+		return 0, 0, false
+	}
+	return width, height, true
+}
+
+// Page 结构没有公开继承属性访问器，这里沿 Parent 链读取 MediaBox。
+func inheritedPageValue(value pdf.Value, key string) pdf.Value {
+	for depth := 0; depth < 64 && !value.IsNull(); depth++ {
+		if found := value.Key(key); !found.IsNull() {
+			return found
+		}
+		value = value.Key("Parent")
+	}
+	return pdf.Value{}
+}
+
+func absFloat(value float64) float64 {
+	if value < 0 {
+		return -value
+	}
+	return value
 }
 
 type PDFInfo struct {
