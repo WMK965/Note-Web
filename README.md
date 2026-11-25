@@ -2,7 +2,7 @@
 
 Note-Web 是一个为网络受限/大体积 PDF 设计的轻量化 PDF 阅读器。尤其适合与同时包含 PDF 和同名 .goodnotes 文件的 [GoodNotes](https://www.goodnotes.com/) 备份目录合用。它会递归扫描指定目录中的 PDF 文件，在浏览器中提供文件夹浏览、搜索、分页阅读、缩放、目录跳转和页面标记功能。
 
-如果 PDF 旁边存在同名的 `.goodnotes` 文件，Note-Web 可以分别读取 GoodNotes 笔记目录、归档内来源 PDF 的目录，以及 A.pdf 本体目录；三种来源可按文档多选。
+如果 PDF 旁边存在同名的 `.goodnotes` 文件，Note-Web 可以分别读取 GoodNotes 自定义目录、`.goodnotes` 归档内来源 PDF 的目录，以及 PDF 自身目录；三种来源可按文档多选。
 
 ## 安全提示
 
