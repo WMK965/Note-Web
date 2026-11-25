@@ -17,7 +17,8 @@ let isSearchMode = false;  // 是否处于搜索模式
 let currentPDF = null;       // 当前 PDF 在数据库中的 ID
 let currentPDFKey = null;    // 当前 PDF 的 cache_key（路径哈希，用于 URL 路由）
 let currentPDFFolder = '';   // 当前 PDF 所在的文件夹路径（用于返回按钮导航）
-let currentOutlineSource = '';// 当前目录来源（goodnotes 或 PDF）
+let currentOutlineSources = []; // 当前实际生效的目录来源
+let currentHasGoodNotes = false; // 当前 PDF 是否有同名 GoodNotes 归档
 let currentPage = 1;         // 当前页码
 let pageCount = 0;           // 当前 PDF 总页数
 let requestID = 0;           // 请求计数器，用于丢弃过时的页面加载请求
@@ -61,6 +62,12 @@ const ICON_FOLDER = '<svg class="folder-icon" viewBox="0 0 24 24" fill="none" st
 const ICON_FILE = '<svg class="pdf-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg>';
 const ICON_BOOKMARK = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/></svg>';
 const ICON_BOOKMARK_FILL = '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/></svg>';
+
+const OUTLINE_SOURCE_LABELS = {
+    notes: 'GoodNotes 笔记目录',
+    source_pdf: 'GoodNotes 来源 PDF 目录',
+    pdf: 'PDF 本体目录',
+};
 
 // ===== 工具函数 =====
 
@@ -249,11 +256,11 @@ function getFolderContents(folder) {
  */
 function renderCacheInfo(pdf) {
     const metaParts = [`${pdf.page_count} 页`, formatSize(pdf.file_size)];
-    if (pdf.outline_source === 'goodnotes') {
-        metaParts.push('<span class="outline-badge">GoodNotes 目录</span>');
-    } else if (pdf.outline_source === 'deep') {
-        metaParts.push('<span class="outline-badge">深度扫描</span>');
-    } else if (pdf.outline_source === 'pdf') {
+    const sources = Array.isArray(pdf.outline_sources) ? pdf.outline_sources : [];
+    if (sources.includes('notes') || sources.includes('source_pdf')) {
+        metaParts.push('<span class="outline-badge">外部目录</span>');
+    }
+    if (sources.includes('pdf')) {
         metaParts.push('<span class="outline-badge">PDF 目录</span>');
     }
     let cacheBar = '';
@@ -502,8 +509,7 @@ function showReader(key, page) {
     if (!pdf) { showToast('PDF not found'); location.hash = '#/'; return; }
     currentPDF = pdf.id;
     currentPDFKey = key;
-    currentOutlineSource = pdf.outline_source || '';
-    $('deep-scan-input').checked = pdf.deep_scan !== false;
+    setCurrentOutlineState(pdf);
     // 计算 PDF 所在文件夹路径（用于返回按钮导航）
     currentPDFFolder = pdf.relative_path.includes('/') ? pdf.relative_path.slice(0, pdf.relative_path.lastIndexOf('/')) : '';
     pageCount = pdf.page_count;
@@ -1198,14 +1204,9 @@ function renderMarks(marks) {
     currentMarks = marks;
     const list = $('marks-list');
     if (marks.length === 0) {
-        let emptyText = '暂无目录或标记<br>可在下方添加';
-        if (currentOutlineSource === 'goodnotes') {
-            emptyText = 'GoodNotes 中暂无目录';
-        } else if (currentOutlineSource === 'deep') {
-            emptyText = '深度扫描未找到目录';
-        } else if (currentOutlineSource === 'pdf') {
-            emptyText = '该 PDF 中暂无目录';
-        }
+        const emptyText = currentOutlineSources.length > 0
+            ? '所选目录来源中暂无目录<br>可在下方添加标记'
+            : '未选择目录来源<br>可在左下菜单中开启';
         list.innerHTML = `<div class="marks-empty">${emptyText}</div>`;
         return;
     }
@@ -1222,19 +1223,21 @@ function renderMarks(marks) {
         }
     }
 
-    // 按来源分组：我的标记 / GoodNotes 目录 / 深度扫描 / PDF 目录。
-    // 每组标题可点击折叠，避免目录项和用户标记混在一起难以分辨。
-    const outlineRoots = roots.filter(m => m.is_outline);
+    // 按真实来源分组；每套来源独立保留自己的树层级。
     const userRoots = roots.filter(m => !m.is_outline);
-    const hasOutline = outlineRoots.length > 0;
-    const outlineGroupKey = 'outline:' + (currentOutlineSource || 'pdf');
-    let outlineLabel = 'PDF 目录';
-    if (currentOutlineSource === 'goodnotes') outlineLabel = 'GoodNotes 目录';
-    else if (currentOutlineSource === 'deep') outlineLabel = '深度扫描';
 
     const groups = [];
     if (userRoots.length > 0) groups.push({ key: 'user', label: '我的标记', roots: userRoots });
-    if (hasOutline) groups.push({ key: outlineGroupKey, label: outlineLabel, roots: outlineRoots });
+    for (const source of ['notes', 'source_pdf', 'pdf']) {
+        const sourceRoots = roots.filter(m => m.is_outline && m.outline_source === source);
+        if (sourceRoots.length > 0) {
+            groups.push({
+                key: 'outline:' + source,
+                label: OUTLINE_SOURCE_LABELS[source] || source,
+                roots: sourceRoots,
+            });
+        }
+    }
 
     // 统计每组的节点数（含子项），显示在标题右侧
     function countNodes(nodes) {
@@ -1491,18 +1494,56 @@ $('mark-title-input').addEventListener('keydown', e => {
     if (e.key === 'Enter') $('mark-add-btn').click();
 });
 
-// ===== 侧栏底部菜单：批量添加目录 / 目录深度扫描 =====
+// ===== 侧栏底部菜单：批量添加 / 刷新 / 多选目录来源 =====
 
 const marksMenu = $('marks-menu');
+let outlineSourcesBusy = false;
+let outlineSourcesExpanded = false;
+
+function setCurrentOutlineState(pdf) {
+    currentOutlineSources = Array.isArray(pdf.outline_sources) ? [...pdf.outline_sources] : [];
+    currentHasGoodNotes = !!pdf.has_goodnotes;
+    updateOutlineMenuState();
+}
+
+function updateOutlineMenuState(statusText = '') {
+    document.querySelectorAll('.menu-checkbox[data-outline-source]').forEach(input => {
+        const source = input.dataset.outlineSource;
+        input.checked = currentOutlineSources.includes(source);
+        input.disabled = outlineSourcesBusy || (source !== 'pdf' && !currentHasGoodNotes);
+    });
+    $('menu-force-refresh').disabled = outlineSourcesBusy;
+    $('outline-source-summary').textContent = currentOutlineSources.length > 0
+        ? `${currentOutlineSources.length} 项`
+        : '未选择';
+    const status = $('outline-source-status');
+    if (statusText) status.textContent = statusText;
+    else if (!currentHasGoodNotes) status.textContent = '未找到同名的 A.goodnotes 归档';
+    else status.textContent = '';
+}
+
+function setOutlineSourcesExpanded(expanded) {
+    outlineSourcesExpanded = expanded;
+    $('outline-sources-panel').classList.toggle('hidden', !expanded);
+    $('menu-outline-select').setAttribute('aria-expanded', expanded ? 'true' : 'false');
+}
+
+function applyUpdatedPDF(pdf) {
+    const index = allPDFs.findIndex(item => item.id === pdf.id);
+    if (index >= 0) allPDFs[index] = pdf;
+    setCurrentOutlineState(pdf);
+}
 
 function closeMarksMenu() {
     marksMenu.classList.add('hidden');
     $('batch-add-btn').setAttribute('aria-expanded', 'false');
+    setOutlineSourcesExpanded(false);
 }
 
 function openMarksMenu() {
     marksMenu.classList.remove('hidden');
     $('batch-add-btn').setAttribute('aria-expanded', 'true');
+    setOutlineSourcesExpanded(false);
 }
 
 $('batch-add-btn').addEventListener('click', e => {
@@ -1524,37 +1565,63 @@ $('menu-batch-add').addEventListener('click', () => {
     $('batch-input').focus();
 });
 
-/**
- * 切换当前 PDF 的目录深度扫描：开启时会立即重算目录，
- * 即从 .goodnotes 内嵌的 PDF 附件里读取它自带的书签。
- */
-async function setDeepScan(enabled) {
-    const input = $('deep-scan-input');
-    input.disabled = true;
+$('menu-outline-select').addEventListener('click', e => {
+    e.stopPropagation();
+    setOutlineSourcesExpanded(!outlineSourcesExpanded);
+});
+
+/** 保存多选目录来源；服务端会立即按新来源重算目录。 */
+async function setOutlineSources(sources) {
+    const previousSources = [...currentOutlineSources];
+    currentOutlineSources = [...sources];
+    outlineSourcesBusy = true;
+    updateOutlineMenuState('正在更新目录来源...');
     try {
-        const res = await api(`/api/pdfs/${currentPDFKey}/deep-scan`, {
+        const res = await api(`/api/pdfs/${currentPDFKey}/outline-sources`, {
             method: 'PUT',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ enabled })
+            body: JSON.stringify({ sources })
         });
         const pdf = await res.json();
-        currentOutlineSource = pdf.outline_source || '';
-        const index = allPDFs.findIndex(p => p.id === pdf.id);
-        if (index >= 0) allPDFs[index] = pdf;
-        input.checked = pdf.deep_scan !== false;
+        applyUpdatedPDF(pdf);
         await loadMarks();
-        showToast(enabled ? '已开启目录深度扫描' : '已关闭目录深度扫描');
+        showToast('目录来源已更新');
     } catch (err) {
-        input.checked = !enabled;
-        showToast('目录深度扫描设置失败');
+        currentOutlineSources = previousSources;
+        updateOutlineMenuState();
+        showToast('目录来源更新失败');
     } finally {
-        input.disabled = false;
+        outlineSourcesBusy = false;
+        updateOutlineMenuState();
     }
 }
 
-$('deep-scan-input').addEventListener('change', e => {
-    closeMarksMenu();
-    setDeepScan(e.target.checked);
+document.querySelectorAll('.menu-checkbox[data-outline-source]').forEach(input => {
+    input.addEventListener('change', () => {
+        const sources = [...document.querySelectorAll('.menu-checkbox[data-outline-source]:checked')]
+            .map(item => item.dataset.outlineSource);
+        setOutlineSources(sources);
+    });
+});
+
+$('menu-force-refresh').addEventListener('click', async () => {
+    const button = $('menu-force-refresh');
+    outlineSourcesBusy = true;
+    button.disabled = true;
+    updateOutlineMenuState('正在强制刷新目录...');
+    try {
+        const res = await api(`/api/pdfs/${currentPDFKey}/outline`, { method: 'POST' });
+        const pdf = await res.json();
+        applyUpdatedPDF(pdf);
+        await loadMarks();
+        showToast('目录已刷新');
+    } catch (err) {
+        showToast('目录刷新失败');
+    } finally {
+        outlineSourcesBusy = false;
+        button.disabled = false;
+        updateOutlineMenuState();
+    }
 });
 
 // 关闭模态窗口

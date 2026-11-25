@@ -61,6 +61,8 @@ func migrate(db *sql.DB) error {
 			goodnotes_path TEXT NOT NULL DEFAULT '',
 			goodnotes_size INTEGER NOT NULL DEFAULT 0,
 			goodnotes_mtime INTEGER NOT NULL DEFAULT 0,
+			outline_sources TEXT NOT NULL DEFAULT 'auto',
+			active_outline_sources TEXT NOT NULL DEFAULT '',
 			outline_origin TEXT NOT NULL DEFAULT '',
 			deep_scan INTEGER NOT NULL DEFAULT -1,
 			deleted INTEGER NOT NULL DEFAULT 0,
@@ -122,6 +124,31 @@ func migrate(db *sql.DB) error {
 		}
 	}
 
+	// 旧版只能保存单一目录来源。首次加入多选来源列时按原状态迁移，
+	// 之后用户明确保存的选择不会再被启动流程覆盖。
+	db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('pdfs') WHERE name = 'outline_sources'`).Scan(&colCount)
+	if colCount == 0 {
+		if _, err := db.Exec(`ALTER TABLE pdfs ADD COLUMN outline_sources TEXT NOT NULL DEFAULT 'auto'`); err != nil {
+			return err
+		}
+		if _, err := db.Exec(`UPDATE pdfs SET outline_sources = CASE
+			WHEN outline_origin = 'goodnotes' THEN 'notes'
+			WHEN outline_origin = 'deep' THEN 'source_pdf'
+			WHEN outline_origin = 'pdf' THEN 'pdf'
+			WHEN deep_scan = 0 THEN 'none'
+			ELSE 'auto'
+		END`); err != nil {
+			return err
+		}
+	}
+
+	db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('pdfs') WHERE name = 'active_outline_sources'`).Scan(&colCount)
+	if colCount == 0 {
+		if _, err := db.Exec(`ALTER TABLE pdfs ADD COLUMN active_outline_sources TEXT NOT NULL DEFAULT ''`); err != nil {
+			return err
+		}
+	}
+
 	// 旧的软删除记录没有时间戳：用 updated_at 回填（表示为 Unix 秒），
 	// 让宽限期从现在开始计算，避免升级后立刻把历史残留全部清掉。
 	if _, err := db.Exec(`UPDATE pdfs SET deleted_at = CAST(strftime('%s', updated_at) AS INTEGER)
@@ -141,6 +168,7 @@ func migrate(db *sql.DB) error {
 			title TEXT NOT NULL,
 			level INTEGER NOT NULL DEFAULT 0,
 			is_outline INTEGER NOT NULL DEFAULT 0,
+			outline_source TEXT NOT NULL DEFAULT '',
 			sort_order REAL NOT NULL DEFAULT 0,
 			parent_id INTEGER DEFAULT NULL,
 			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -161,6 +189,22 @@ func migrate(db *sql.DB) error {
 	if markColCount == 0 {
 		if _, err := db.Exec(`ALTER TABLE page_marks ADD COLUMN parent_id INTEGER DEFAULT NULL`); err != nil {
 			log.Printf("migration: failed to add parent_id column: %v", err)
+		}
+	}
+	db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('page_marks') WHERE name = 'outline_source'`).Scan(&markColCount)
+	if markColCount == 0 {
+		if _, err := db.Exec(`ALTER TABLE page_marks ADD COLUMN outline_source TEXT NOT NULL DEFAULT ''`); err != nil {
+			return err
+		}
+		if _, err := db.Exec(`UPDATE page_marks SET outline_source = CASE (
+				SELECT outline_origin FROM pdfs WHERE pdfs.id = page_marks.pdf_id
+			)
+			WHEN 'goodnotes' THEN 'notes'
+			WHEN 'deep' THEN 'source_pdf'
+			WHEN 'pdf' THEN 'pdf'
+			ELSE 'pdf'
+		END WHERE is_outline = 1`); err != nil {
+			return err
 		}
 	}
 
@@ -184,7 +228,7 @@ func migrate(db *sql.DB) error {
 		if _, err := db.Exec(`DELETE FROM page_marks WHERE is_outline = 1`); err != nil {
 			log.Printf("migration: failed to drop stale outline marks: %v", err)
 		}
-		if _, err := db.Exec(`UPDATE pdfs SET goodnotes_path = '', goodnotes_size = 0, goodnotes_mtime = 0, outline_origin = ''`); err != nil {
+		if _, err := db.Exec(`UPDATE pdfs SET goodnotes_path = '', goodnotes_size = 0, goodnotes_mtime = 0, active_outline_sources = '', outline_origin = ''`); err != nil {
 			log.Printf("migration: failed to reset GoodNotes source state: %v", err)
 		}
 		if _, err := db.Exec(`INSERT INTO meta (key, value) VALUES (?, ?)
@@ -235,6 +279,7 @@ func rebuildMarksWithCascade(db *sql.DB) error {
 			title TEXT NOT NULL,
 			level INTEGER NOT NULL DEFAULT 0,
 			is_outline INTEGER NOT NULL DEFAULT 0,
+			outline_source TEXT NOT NULL DEFAULT '',
 			sort_order REAL NOT NULL DEFAULT 0,
 			parent_id INTEGER DEFAULT NULL,
 			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -243,8 +288,8 @@ func rebuildMarksWithCascade(db *sql.DB) error {
 		return err
 	}
 	if _, err := tx.Exec(`INSERT INTO page_marks_migrated
-			(id, pdf_id, page_num, title, level, is_outline, sort_order, parent_id, created_at)
-		SELECT id, pdf_id, page_num, title, level, is_outline, sort_order, parent_id, created_at
+	(id, pdf_id, page_num, title, level, is_outline, outline_source, sort_order, parent_id, created_at)
+		SELECT id, pdf_id, page_num, title, level, is_outline, outline_source, sort_order, parent_id, created_at
 		FROM page_marks`); err != nil {
 		return err
 	}
@@ -267,7 +312,7 @@ func rebuildMarksWithCascade(db *sql.DB) error {
 // 目录解析逻辑的版本号，变更解析方式时递增即可让旧数据重新提取
 const (
 	keyOutlineParser     = "outline_parser"
-	outlineParserVersion = "5"
+	outlineParserVersion = "6"
 	keyLastVacuum        = "last_vacuum"
 )
 
@@ -275,7 +320,7 @@ const pdfColumns = `id, path, title, cache_key, page_count, file_size, file_mtim
 		       pinned, cache_active, cache_size, cached_pages, cache_last_access,
 		       deleted, rebuilding, cache_version, changed_pages,
 		       goodnotes_path, goodnotes_size, goodnotes_mtime, created_at, updated_at,
-		       deleted_at, outline_origin, deep_scan`
+		       deleted_at, outline_sources, active_outline_sources, outline_origin, deep_scan`
 
 func scanPDF(r interface{ Scan(...interface{}) error }) (*models.PDF, error) {
 	p := &models.PDF{}
@@ -287,7 +332,7 @@ func scanPDF(r interface{ Scan(...interface{}) error }) (*models.PDF, error) {
 		&pinned, &cacheActive, &p.CacheSize, &p.CachedPages, &cacheLastAccess,
 		&deleted, &rebuilding, &p.CacheVersion, &p.ChangedPages,
 		&p.GoodNotesPath, &p.GoodNotesSize, &p.GoodNotesMtime, &p.CreatedAt, &p.UpdatedAt,
-		&deletedAt, &p.OutlineOrigin, &p.DeepScan,
+		&deletedAt, &p.OutlineSources, &p.ActiveOutlineSources, &p.OutlineOrigin, &p.DeepScan,
 	); err != nil {
 		return nil, err
 	}
@@ -395,6 +440,20 @@ func (db *Database) UpdatePDFMetadata(id int64, title string, pageCount int, fil
 func (db *Database) SetOutlineSource(id int64, path string, fileSize, fileMtime int64, origin string) error {
 	_, err := db.Exec(`UPDATE pdfs SET goodnotes_path = ?, goodnotes_size = ?, goodnotes_mtime = ?, outline_origin = ?, updated_at = ? WHERE id = ?`,
 		path, fileSize, fileMtime, origin, time.Now(), id)
+	return err
+}
+
+// SetOutlineSources 保存用户选择的目录来源集合。
+func (db *Database) SetOutlineSources(id int64, sources string) error {
+	if sources != models.OutlineSourcesAuto && sources != models.OutlineSourcesNone {
+		normalized := models.NormalizeOutlineSources(strings.Split(sources, ","))
+		if len(normalized) == 0 {
+			return fmt.Errorf("invalid outline sources: %q", sources)
+		}
+		sources = strings.Join(normalized, ",")
+	}
+	_, err := db.Exec(`UPDATE pdfs SET outline_sources = ?, updated_at = ? WHERE id = ?`,
+		sources, time.Now(), id)
 	return err
 }
 
@@ -709,7 +768,7 @@ func (db *Database) GetCacheStatus(id int64) (*models.CacheStatus, error) {
 
 func (db *Database) ListMarks(pdfID int64) ([]*models.PageMark, error) {
 	rows, err := db.Query(`
-		SELECT id, page_num, title, level, is_outline, sort_order, parent_id FROM page_marks
+		SELECT id, page_num, title, level, is_outline, outline_source, sort_order, parent_id FROM page_marks
 		WHERE pdf_id = ? ORDER BY sort_order ASC, id ASC
 	`, pdfID)
 	if err != nil {
@@ -722,7 +781,7 @@ func (db *Database) ListMarks(pdfID int64) ([]*models.PageMark, error) {
 		m := &models.PageMark{}
 		var isOutline int
 		var parentID sql.NullInt64
-		if err := rows.Scan(&m.ID, &m.PageNum, &m.Title, &m.Level, &isOutline, &m.SortOrder, &parentID); err != nil {
+		if err := rows.Scan(&m.ID, &m.PageNum, &m.Title, &m.Level, &isOutline, &m.OutlineSource, &m.SortOrder, &parentID); err != nil {
 			return nil, err
 		}
 		m.IsOutline = isOutline == 1
@@ -820,16 +879,16 @@ func (db *Database) AddOutlineMarks(pdfID int64, entries []models.OutlineEntry) 
 	if err != nil {
 		return err
 	}
-	if err := addOutlineMarks(tx, pdfID, entries); err != nil {
+	if _, err := addOutlineMarks(tx, pdfID, models.OutlineSourcePDF, entries, 1); err != nil {
 		tx.Rollback()
 		return err
 	}
 	return tx.Commit()
 }
 
-// ReplaceOutlineMarksFromArchive 原子地替换自动生成的目录项，
-// 并记录归档签名（路径/大小/修改时间）与目录来源（goodnotes 或 pdf）。
-func (db *Database) ReplaceOutlineMarksFromArchive(pdfID int64, entries []models.OutlineEntry, path string, fileSize, fileMtime int64, origin string) error {
+// ReplaceOutlineMarks 原子地替换自动生成的目录项。每个来源分别建立父子关系，
+// 避免不同来源的层级被错误串接。
+func (db *Database) ReplaceOutlineMarks(pdfID int64, entriesBySource map[string][]models.OutlineEntry, path string, fileSize, fileMtime int64, sourcePreference, activeSources string) error {
 	tx, err := db.Begin()
 	if err != nil {
 		return err
@@ -842,16 +901,39 @@ func (db *Database) ReplaceOutlineMarksFromArchive(pdfID int64, entries []models
 		tx.Rollback()
 		return err
 	}
-	if err := addOutlineMarks(tx, pdfID, entries); err != nil {
-		tx.Rollback()
-		return err
+	nextOrder := 1.0
+	for _, source := range models.NormalizeOutlineSources(mapKeys(entriesBySource)) {
+		var insertErr error
+		nextOrder, insertErr = addOutlineMarks(tx, pdfID, source, entriesBySource[source], nextOrder)
+		if insertErr != nil {
+			tx.Rollback()
+			return insertErr
+		}
 	}
+	origin := legacyOutlineOrigin(activeSources)
 	if _, err := tx.Exec(`UPDATE pdfs SET goodnotes_path = ?, goodnotes_size = ?, goodnotes_mtime = ?, outline_origin = ?, updated_at = ? WHERE id = ?`,
 		path, fileSize, fileMtime, origin, time.Now(), pdfID); err != nil {
 		tx.Rollback()
 		return err
 	}
+	if _, err := tx.Exec(`UPDATE pdfs SET outline_sources = ?, active_outline_sources = ? WHERE id = ?`,
+		sourcePreference, activeSources, pdfID); err != nil {
+		tx.Rollback()
+		return err
+	}
 	return tx.Commit()
+}
+
+// ReplaceOutlineMarksFromArchive 保留旧调用方式，供兼容测试和旧代码使用。
+func (db *Database) ReplaceOutlineMarksFromArchive(pdfID int64, entries []models.OutlineEntry, path string, fileSize, fileMtime int64, origin string) error {
+	source := outlineSourceFromLegacyOrigin(origin)
+	bySource := map[string][]models.OutlineEntry{}
+	rawSources := models.OutlineSourcesNone
+	if source != "" {
+		bySource[source] = entries
+		rawSources = models.EncodeOutlineSources([]string{source})
+	}
+	return db.ReplaceOutlineMarks(pdfID, bySource, path, fileSize, fileMtime, rawSources, rawSources)
 }
 
 type statementExecutor interface {
@@ -866,7 +948,7 @@ func detachOutlineChildren(executor statementExecutor, pdfID int64) error {
 	return err
 }
 
-func addOutlineMarks(executor statementExecutor, pdfID int64, entries []models.OutlineEntry) error {
+func addOutlineMarks(executor statementExecutor, pdfID int64, source string, entries []models.OutlineEntry, startOrder float64) (float64, error) {
 	// 按层级维护祖先栈，为每个目录项算出父级：
 	// 前端按 parent_id 渲染树形目录，缺失父级就会退化为平铺列表
 	var stack []int64
@@ -885,18 +967,55 @@ func addOutlineMarks(executor statementExecutor, pdfID int64, entries []models.O
 			parentID = stack[len(stack)-1]
 		}
 
-		res, err := executor.Exec(`INSERT INTO page_marks (pdf_id, page_num, title, level, is_outline, parent_id, sort_order)
-			VALUES (?, ?, ?, ?, 1, ?, ?)`,
-			pdfID, e.Page, e.Title, level, parentID, float64(i+1))
+		order := startOrder + float64(i)
+		res, err := executor.Exec(`INSERT INTO page_marks (pdf_id, page_num, title, level, is_outline, outline_source, parent_id, sort_order)
+			VALUES (?, ?, ?, ?, 1, ?, ?, ?)`,
+			pdfID, e.Page, e.Title, level, source, parentID, order)
 		if err != nil {
-			return err
+			return startOrder, err
 		}
 
 		id, err := res.LastInsertId()
 		if err != nil {
-			return err
+			return startOrder, err
 		}
 		stack = append(stack, id)
 	}
-	return nil
+	return startOrder + float64(len(entries)), nil
+}
+
+func mapKeys[T any](m map[string]T) []string {
+	keys := make([]string, 0, len(m))
+	for key := range m {
+		keys = append(keys, key)
+	}
+	return keys
+}
+
+func outlineSourceFromLegacyOrigin(origin string) string {
+	switch origin {
+	case "goodnotes":
+		return models.OutlineSourceNotes
+	case "deep":
+		return models.OutlineSourceSourcePDF
+	case "pdf":
+		return models.OutlineSourcePDF
+	default:
+		return ""
+	}
+}
+
+func legacyOutlineOrigin(rawSources string) string {
+	sources := models.ParseOutlineSources(rawSources)
+	if len(sources) == 0 {
+		return ""
+	}
+	switch sources[0] {
+	case models.OutlineSourceNotes:
+		return "goodnotes"
+	case models.OutlineSourceSourcePDF:
+		return "deep"
+	default:
+		return "pdf"
+	}
 }

@@ -17,6 +17,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -43,6 +44,26 @@ type Options struct {
 // 没有目录时返回空切片和 nil 错误。
 func Parse(data []byte) ([]models.OutlineEntry, error) {
 	return ParseWithOptions(data, Options{})
+}
+
+// ParseFile 读取 PDF 文件并解析其自带目录。
+func ParseFile(path string, opts Options) ([]models.OutlineEntry, error) {
+	maxSize := opts.MaxFileSize
+	if maxSize <= 0 {
+		maxSize = DefaultMaxFileSize
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+	if info.Size() > maxSize {
+		return nil, fmt.Errorf("pdf too large: %d bytes", info.Size())
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	return ParseWithOptions(data, Options{MaxFileSize: maxSize})
 }
 
 // ParseWithOptions 与 Parse 相同，但可以指定体积上限等参数

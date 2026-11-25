@@ -16,6 +16,7 @@ import (
 	"note-web/internal/db"
 	"note-web/internal/goodnotes"
 	"note-web/internal/models"
+	"note-web/internal/pdfoutline"
 	"note-web/internal/renderer"
 	"note-web/internal/util"
 )
@@ -167,7 +168,8 @@ func (s *Scanner) processPDF(path string, info os.FileInfo, companion *scannedFi
 	} else if existing != nil {
 		goodNotesChanged = existing.GoodNotesPath != ""
 	}
-	if !pdfChanged && !goodNotesChanged {
+	outlineNeedsRefresh := existing != nil && existing.ActiveOutlineSources == ""
+	if !pdfChanged && !goodNotesChanged && !outlineNeedsRefresh {
 		return
 	}
 
@@ -200,22 +202,10 @@ func (s *Scanner) processPDF(path string, info os.FileInfo, companion *scannedFi
 	safeTitle := strings.ReplaceAll(title, "\n", " ")
 	safeTitle = strings.ReplaceAll(safeTitle, "\r", "")
 
-	if companion != nil {
-		// 目录深度扫描：磁盘上的 PDF 没有 GoodNotes 目录时，读归档内嵌 PDF 的书签
-		if err := s.applyOutline(id, pageCount, companion.path, companion.info, deepScanEnabled(existing), safeTitle); err != nil {
+	if pdfChanged || goodNotesChanged || outlineNeedsRefresh {
+		if err := s.applyOutline(id, pageCount, path, companion, safeTitle); err != nil {
 			// 自动备份可能正在写入；保留上一次成功结果并在下轮扫描重试。
-			log.Printf("failed to load outline from %s: %v", companion.path, err)
-		}
-	} else if existing != nil && existing.GoodNotesPath != "" {
-		if err := s.db.DeleteOutlineMarks(id); err != nil {
-			log.Printf("failed to clear removed GoodNotes outline for PDF %d: %v", id, err)
-		} else if err := s.db.SetOutlineSource(id, "", 0, 0, ""); err != nil {
-			log.Printf("failed to clear GoodNotes source for PDF %d: %v", id, err)
-		}
-	} else if pdfChanged && existing != nil {
-		// 没有 GoodNotes 伴随文件时，PDF 变化会让原 PDF 目录失效。
-		if err := s.db.DeleteOutlineMarks(id); err != nil {
-			log.Printf("failed to reset outline for updated PDF %d: %v", id, err)
+			log.Printf("failed to load outline for %s: %v", path, err)
 		}
 	}
 
@@ -240,43 +230,117 @@ func (s *Scanner) processPDF(path string, info os.FileInfo, companion *scannedFi
 	}
 }
 
-// applyOutline 解析归档目录并写入数据库，pageCount 用于把越界页码降级为纯标题
-func (s *Scanner) applyOutline(pdfID int64, pageCount int, companionPath string, info os.FileInfo, deepScan bool, title string) error {
+// applyOutline 按用户来源偏好解析目录并写入数据库，pageCount 用于把越界页码降级为纯标题。
+func (s *Scanner) applyOutline(pdfID int64, pageCount int, pdfPath string, companion *scannedFile, title string) error {
 	start := time.Now()
-	outline, err := goodnotes.ParseFileWithOptions(companionPath, goodnotes.Options{
-		DeepScan:    deepScan,
-		MaxFileSize: s.maxFileSize,
-	})
+	pdf, err := s.db.GetPDF(pdfID)
 	if err != nil {
 		return err
 	}
-	entries := outline.Entries
-	for i := range entries {
-		if entries[i].Page > pageCount {
-			entries[i].Page = 0
+
+	preference := strings.TrimSpace(pdf.OutlineSources)
+	if preference == "" {
+		preference = models.OutlineSourcesAuto
+	}
+	auto := preference == models.OutlineSourcesAuto
+	selected := models.ParseOutlineSources(preference)
+	needsNotes := auto || containsOutlineSource(selected, models.OutlineSourceNotes)
+	needsSourcePDF := auto || containsOutlineSource(selected, models.OutlineSourceSourcePDF)
+	needsPDF := containsOutlineSource(selected, models.OutlineSourcePDF) || (auto && companion == nil)
+
+	entriesBySource := make(map[string][]models.OutlineEntry)
+	available := make(map[string]bool)
+	if companion != nil && (needsNotes || needsSourcePDF) {
+		archiveOutline, err := goodnotes.ParseSources(companion.path, goodnotes.Options{MaxFileSize: s.maxFileSize})
+		if err != nil {
+			return err
+		}
+		if needsNotes {
+			entriesBySource[models.OutlineSourceNotes] = archiveOutline.Notes
+			available[models.OutlineSourceNotes] = len(archiveOutline.Notes) > 0
+		}
+		if needsSourcePDF {
+			entriesBySource[models.OutlineSourceSourcePDF] = archiveOutline.SourcePDF
+			available[models.OutlineSourceSourcePDF] = len(archiveOutline.SourcePDF) > 0
 		}
 	}
-	if err := s.db.ReplaceOutlineMarksFromArchive(pdfID, entries, companionPath, info.Size(), info.ModTime().UnixNano(), outline.Source); err != nil {
+
+	if needsPDF {
+		info, statErr := os.Stat(pdfPath)
+		if statErr != nil || (s.maxFileSize > 0 && info.Size() > s.maxFileSize) {
+			log.Printf("skipping PDF body outline for %s: file exceeds size limit or is unavailable", pdfPath)
+		} else {
+			entries, parseErr := pdfoutline.ParseFile(pdfPath, pdfoutline.Options{MaxFileSize: s.maxFileSize})
+			if parseErr != nil && s.renderer != nil {
+				entries, parseErr = s.renderer.GetOutline(pdfPath)
+			}
+			if parseErr != nil {
+				log.Printf("failed to parse PDF body outline for %s: %v", pdfPath, parseErr)
+			} else {
+				entriesBySource[models.OutlineSourcePDF] = entries
+				available[models.OutlineSourcePDF] = len(entries) > 0
+			}
+		}
+	}
+
+	active := selected
+	if auto {
+		active = nil
+		if available[models.OutlineSourceNotes] {
+			active = []string{models.OutlineSourceNotes}
+		} else if available[models.OutlineSourceSourcePDF] {
+			active = []string{models.OutlineSourceSourcePDF}
+		} else if companion == nil {
+			active = []string{models.OutlineSourcePDF}
+		}
+	}
+
+	for source, entries := range entriesBySource {
+		if !containsOutlineSource(active, source) {
+			delete(entriesBySource, source)
+			continue
+		}
+		for i := range entries {
+			if entries[i].Page > pageCount {
+				entries[i].Page = 0
+			}
+		}
+		entriesBySource[source] = entries
+	}
+
+	companionPath := ""
+	var fileSize, fileMtime int64
+	if companion != nil {
+		companionPath = companion.path
+		fileSize = companion.info.Size()
+		fileMtime = companion.info.ModTime().UnixNano()
+	}
+	activeRaw := models.EncodeOutlineSources(active)
+	if err := s.db.ReplaceOutlineMarks(pdfID, entriesBySource, companionPath, fileSize, fileMtime, preference, activeRaw); err != nil {
 		return err
 	}
-	if len(entries) > 0 {
-		log.Printf("loaded %d %s outline entries for %s (%.1fs)", len(entries), outline.Source, title, time.Since(start).Seconds())
+	total := 0
+	for _, entries := range entriesBySource {
+		total += len(entries)
+	}
+	if total > 0 {
+		log.Printf("loaded %d outline entries from %s for %s (%.1fs)", total, activeRaw, title, time.Since(start).Seconds())
 	} else {
-		log.Printf("no outline found in %s (%.1fs)", companionPath, time.Since(start).Seconds())
+		log.Printf("no outline entries found for %s (%.1fs)", title, time.Since(start).Seconds())
 	}
 	return nil
 }
 
-// deepScanEnabled 读取单个 PDF 的深度扫描偏好：1 开启、0 关闭、-1 自动开启
-func deepScanEnabled(pdf *models.PDF) bool {
-	if pdf == nil {
-		return true
+func containsOutlineSource(sources []string, want string) bool {
+	for _, source := range sources {
+		if source == want {
+			return true
+		}
 	}
-	return pdf.DeepScan != 0
+	return false
 }
 
-// RefreshOutline 立即按当前偏好重新解析某个 PDF 的归档目录。
-// 用户切换“目录深度扫描”后调用，不必等下一轮定时扫描。
+// RefreshOutline 立即按当前来源选择重新解析目录，不必等下一轮定时扫描。
 func (s *Scanner) RefreshOutline(pdfID int64) error {
 	pdf, err := s.db.GetPDF(pdfID)
 	if err != nil {
@@ -285,12 +349,11 @@ func (s *Scanner) RefreshOutline(pdfID int64) error {
 	if pdf.Deleted {
 		return fmt.Errorf("pdf %d is marked as deleted", pdfID)
 	}
-	companionPath, info, ok := findCompanion(pdf.Path)
-	if !ok {
-		// 没有归档文件时没有可解析的目录来源，保持现状
-		return nil
+	var companion *scannedFile
+	if companionPath, info, ok := findCompanion(pdf.Path); ok {
+		companion = &scannedFile{path: companionPath, info: info}
 	}
-	return s.applyOutline(pdf.ID, pdf.PageCount, companionPath, info, deepScanEnabled(pdf), pdf.Title)
+	return s.applyOutline(pdf.ID, pdf.PageCount, pdf.Path, companion, pdf.Title)
 }
 
 // findCompanion 查找与 PDF 同目录同名的 .goodnotes 文件（大小写不敏感）

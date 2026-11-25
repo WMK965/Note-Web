@@ -13,6 +13,7 @@ import (
 	"note-web/internal/cache"
 	"note-web/internal/config"
 	"note-web/internal/db"
+	"note-web/internal/models"
 	"note-web/internal/renderer"
 	"note-web/internal/util"
 )
@@ -226,7 +227,10 @@ func TestPageImageRevalidation(t *testing.T) {
 func TestPDFResponseReportsGoodNotesOutline(t *testing.T) {
 	env := newTestEnv(t, "")
 	key, id := env.addCachedPDF(t, "book.pdf", 2)
-	if err := env.db.SetOutlineSource(id, filepath.Join(env.cfg.Documents.Dirs[0], "book.goodnotes"), 123, 456, "goodnotes"); err != nil {
+	sources := models.EncodeOutlineSources([]string{models.OutlineSourceNotes})
+	if err := env.db.ReplaceOutlineMarks(id, map[string][]models.OutlineEntry{
+		models.OutlineSourceNotes: {{Level: 0, Page: 1, Title: "笔记目录"}},
+	}, filepath.Join(env.cfg.Documents.Dirs[0], "book.goodnotes"), 123, 456, sources, sources); err != nil {
 		t.Fatal(err)
 	}
 
@@ -234,16 +238,19 @@ func TestPDFResponseReportsGoodNotesOutline(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200", resp.StatusCode)
 	}
-	if !strings.Contains(body, `"outline_source":"goodnotes"`) {
+	if !strings.Contains(body, `"outline_sources":["notes"]`) || !strings.Contains(body, `"has_goodnotes":true`) {
 		t.Fatalf("response does not report GoodNotes outline: %s", body)
 	}
 }
 
-// 目录来自归档内嵌 PDF 时，接口要如实报告来源，前端才能显示成 PDF 目录
+// 目录来自 A.pdf 本体时，接口要如实报告来源。
 func TestPDFResponseReportsPDFOutlineSource(t *testing.T) {
 	env := newTestEnv(t, "")
 	key, id := env.addCachedPDF(t, "book.pdf", 2)
-	if err := env.db.SetOutlineSource(id, filepath.Join(env.cfg.Documents.Dirs[0], "book.goodnotes"), 123, 456, "pdf"); err != nil {
+	sources := models.EncodeOutlineSources([]string{models.OutlineSourcePDF})
+	if err := env.db.ReplaceOutlineMarks(id, map[string][]models.OutlineEntry{
+		models.OutlineSourcePDF: {{Level: 0, Page: 1, Title: "本体目录"}},
+	}, "", 0, 0, sources, sources); err != nil {
 		t.Fatal(err)
 	}
 
@@ -251,7 +258,7 @@ func TestPDFResponseReportsPDFOutlineSource(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200", resp.StatusCode)
 	}
-	if !strings.Contains(body, `"outline_source":"pdf"`) {
+	if !strings.Contains(body, `"outline_sources":["pdf"]`) {
 		t.Fatalf("response does not report PDF outline source: %s", body)
 	}
 }
@@ -267,29 +274,29 @@ func (f *fakeRefresher) RefreshOutline(pdfID int64) error {
 	return f.err
 }
 
-// 深度扫描开关：写入偏好、立即重算目录，并把最新状态返回给前端
-func TestSetDeepScanEndpoint(t *testing.T) {
+// 多选目录来源：写入偏好、立即重算目录，并把最新状态返回给前端
+func TestSetOutlineSourcesEndpoint(t *testing.T) {
 	env := newTestEnv(t, "")
 	key, id := env.addCachedPDF(t, "book.pdf", 2)
 	refresher := &fakeRefresher{}
 	env.api.SetOutlineRefresher(refresher)
 
-	req, err := http.NewRequest(http.MethodPut, env.server.URL+"/api/pdfs/"+key+"/deep-scan",
-		strings.NewReader(`{"enabled":false}`))
+	req, err := http.NewRequest(http.MethodPut, env.server.URL+"/api/pdfs/"+key+"/outline-sources",
+		strings.NewReader(`{"sources":["notes","pdf"]}`))
 	if err != nil {
 		t.Fatal(err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := env.client.Do(req)
 	if err != nil {
-		t.Fatalf("PUT deep-scan: %v", err)
+		t.Fatalf("PUT outline-sources: %v", err)
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d body = %s", resp.StatusCode, body)
 	}
-	if !strings.Contains(string(body), `"deep_scan":false`) {
+	if !strings.Contains(string(body), `"outline_sources":["notes","pdf"]`) {
 		t.Errorf("response does not report the new state: %s", body)
 	}
 
@@ -297,23 +304,23 @@ func TestSetDeepScanEndpoint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if pdf.DeepScan != 0 {
-		t.Errorf("stored deep scan mode = %d, want 0", pdf.DeepScan)
+	if pdf.OutlineSources != models.EncodeOutlineSources([]string{models.OutlineSourceNotes, models.OutlineSourcePDF}) {
+		t.Errorf("stored outline sources = %q", pdf.OutlineSources)
 	}
 	if len(refresher.ids) != 1 || refresher.ids[0] != id {
 		t.Errorf("refresher calls = %v, want [%d]", refresher.ids, id)
 	}
 
-	// 再次开启
-	req, err = http.NewRequest(http.MethodPut, env.server.URL+"/api/pdfs/"+key+"/deep-scan",
-		strings.NewReader(`{"enabled":true}`))
+	// 只保留来源 PDF 目录
+	req, err = http.NewRequest(http.MethodPut, env.server.URL+"/api/pdfs/"+key+"/outline-sources",
+		strings.NewReader(`{"sources":["source_pdf"]}`))
 	if err != nil {
 		t.Fatal(err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	resp2, err := env.client.Do(req)
 	if err != nil {
-		t.Fatalf("PUT deep-scan (enable): %v", err)
+		t.Fatalf("PUT outline-sources (source_pdf): %v", err)
 	}
 	defer resp2.Body.Close()
 	if resp2.StatusCode != http.StatusOK {
@@ -323,7 +330,50 @@ func TestSetDeepScanEndpoint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if pdf.DeepScan != 1 {
-		t.Errorf("stored deep scan mode = %d, want 1", pdf.DeepScan)
+	if pdf.OutlineSources != models.OutlineSourceSourcePDF {
+		t.Errorf("stored outline sources = %q, want source_pdf", pdf.OutlineSources)
+	}
+}
+
+func TestForceRefreshOutlineEndpoint(t *testing.T) {
+	env := newTestEnv(t, "")
+	key, id := env.addCachedPDF(t, "book.pdf", 2)
+	refresher := &fakeRefresher{}
+	env.api.SetOutlineRefresher(refresher)
+
+	req, err := http.NewRequest(http.MethodPost, env.server.URL+"/api/pdfs/"+key+"/outline", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := env.client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d body = %s", resp.StatusCode, body)
+	}
+	if len(refresher.ids) != 1 || refresher.ids[0] != id {
+		t.Errorf("refresher calls = %v, want [%d]", refresher.ids, id)
+	}
+}
+
+func TestSetOutlineSourcesRejectsUnknownSource(t *testing.T) {
+	env := newTestEnv(t, "")
+	key, _ := env.addCachedPDF(t, "book.pdf", 2)
+	req, err := http.NewRequest(http.MethodPut, env.server.URL+"/api/pdfs/"+key+"/outline-sources",
+		strings.NewReader(`{"sources":["unknown"]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := env.client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", resp.StatusCode)
 	}
 }

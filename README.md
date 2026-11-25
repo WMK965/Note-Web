@@ -2,7 +2,7 @@
 
 Note-Web 是一个为网络受限/大体积 PDF 设计的轻量化 PDF 阅读器。尤其适合与同时包含 PDF 和同名 .goodnotes 文件的 [GoodNotes](https://www.goodnotes.com/) 备份目录合用。它会递归扫描指定目录中的 PDF 文件，在浏览器中提供文件夹浏览、搜索、分页阅读、缩放、目录跳转和页面标记功能。
 
-如果 PDF 旁边存在同名的 `.goodnotes` 文件，Note-Web 还可以读取 GoodNotes 中保存的目录；对于导入时保留在归档附件中的 PDF 目录，也可以按文档开启深度扫描。
+如果 PDF 旁边存在同名的 `.goodnotes` 文件，Note-Web 可以分别读取 GoodNotes 笔记目录、归档内来源 PDF 的目录，以及 A.pdf 本体目录；三种来源可按文档多选。
 
 ## 安全提示
 
@@ -15,7 +15,7 @@ Note-Web 当前**没有内置用户认证或权限管理**。它适合放在可�
 - 页面与缩略图按需渲染并缓存；可将常用 PDF 标记为主动缓存，后台预渲染全部页面。
 - 被动缓存按 LRU 策略受容量限制，避免缓存无限增长。
 - PDF 文件变更后自动失效或重建缓存；主动缓存支持延迟重建，适合仍在同步中的笔记文件。
-- 支持 PDF 自带目录、GoodNotes 目录、GoodNotes 归档内嵌 PDF 的深度扫描，以及用户自定义目录和页面标记。
+- 支持 PDF 本体目录、GoodNotes 笔记目录、GoodNotes 来源 PDF 目录、多选目录来源，以及用户自定义目录和页面标记。
 - 支持通过 `server.proxy_path` 在反向代理的子路径下访问。
 
 ## 快速开始（Docker）
@@ -109,7 +109,7 @@ go build -o note-web .
 | `documents.dirs` | 要扫描的目录列表 | `[/documents]` |
 | `documents.scan_interval` | 定时扫描间隔 | `5m` |
 | `documents.retention` | 文件消失后保留记录的时间 | `30d` |
-| `documents.max_file_size` | 深度扫描允许读取的 PDF 大小上限 | `1G` |
+| `documents.max_file_size` | 提取 A.pdf 本体或归档来源 PDF 目录时允许读取的大小上限 | `1G` |
 | `cache.dir` | 页面缓存目录 | `/data/cache` |
 | `cache.max_size_mb` | 被动缓存容量上限 | `2048` |
 | `cache.active.*` | 主动缓存并发、变更延迟和轮询间隔 | 见示例 |
@@ -124,7 +124,7 @@ go build -o note-web .
 2. 在文件库中点击文档即可阅读；页面首次访问时会生成 JPEG 缓存，后续访问复用服务端缓存，并通过 ETag 校验内容是否更新。
 3. 点击书签图标可将文档设为主动缓存。主动缓存会在后台预渲染全部页面，并在文件变化后按 `cache.active.watch_debounce` 延迟重建。
 4. 阅读器中的“目录与标记”面板可用于跳转、添加/删除标记和拖拽排序。批量目录使用“标题 -- 页码”格式，每行一项；省略页码时使用 `0`，表示纯标题。
-5. 对带有同名 `.goodnotes` 归档的 PDF，目录优先来自 GoodNotes。需要读取 GoodNotes 归档内嵌 PDF 的原始目录时，在目录面板中开启“目录深度扫描”。
+5. 在“目录与标记”左下菜单中可多选“GoodNotes 笔记目录”“GoodNotes 来源 PDF 目录”和“PDF 本体目录”，也可强制刷新当前选择。不同来源会在侧栏中分别成组显示。
 
 ## 数据与目录
 

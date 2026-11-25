@@ -48,7 +48,7 @@ type Server struct {
 	refresher outlineRefresher
 }
 
-// outlineRefresher 让接口层在用户切换目录深度扫描后立即重算目录
+// outlineRefresher 让接口层在用户切换目录来源或强制刷新时立即重算目录
 type outlineRefresher interface {
 	RefreshOutline(pdfID int64) error
 }
@@ -125,12 +125,12 @@ func (s *Server) registerRoutes(mux *http.ServeMux, prefix string) {
 	mux.HandleFunc("GET "+prefix+"/api/pdfs/{key}/cache", s.handleCacheStatus)
 	mux.HandleFunc("POST "+prefix+"/api/pdfs/{key}/render", s.handleForceRender)
 	mux.HandleFunc("GET "+prefix+"/api/pdfs/{key}/marks", s.handleListMarks)
-	mux.HandleFunc("PUT "+prefix+"/api/pdfs/{key}/deep-scan", s.handleSetDeepScan)
+	mux.HandleFunc("PUT "+prefix+"/api/pdfs/{key}/outline-sources", s.handleSetOutlineSources)
 	mux.HandleFunc("POST "+prefix+"/api/pdfs/{key}/marks", s.handleAddMark)
 	mux.HandleFunc("DELETE "+prefix+"/api/pdfs/{key}/marks/{markId}", s.handleDeleteMark)
 	mux.HandleFunc("PUT "+prefix+"/api/pdfs/{key}/marks/reorder", s.handleReorderMarks)
 	mux.HandleFunc("POST "+prefix+"/api/pdfs/{key}/marks/batch", s.handleBatchAddMarks)
-	mux.HandleFunc("POST "+prefix+"/api/pdfs/{key}/outline", s.handleExtractOutline)
+	mux.HandleFunc("POST "+prefix+"/api/pdfs/{key}/outline", s.handleRefreshOutline)
 	mux.HandleFunc("GET "+prefix+"/api/cache/stats", s.handleCacheStats)
 }
 
@@ -169,43 +169,47 @@ func (s *Server) relativePath(absPath string) string {
 }
 
 type pdfListItem struct {
-	ID            int64  `json:"id"`
-	CacheKey      string `json:"cache_key"`
-	Title         string `json:"title"`
-	RelativePath  string `json:"relative_path"`
-	PageCount     int    `json:"page_count"`
-	FileSize      int64  `json:"file_size"`
-	Pinned        bool   `json:"pinned"`
-	CachedPages   int    `json:"cached_pages"`
-	CacheActive   bool   `json:"cache_active"`
-	CacheSize     int64  `json:"cache_size_mb"`
-	OutlineSource string `json:"outline_source,omitempty"`
-	DeepScan      bool   `json:"deep_scan"`
-}
-
-// outlineSource 返回目录来源：goodnotes（GoodNotes 自建目录）、
-// deep（深度扫描归档内嵌 PDF）、pdf（用 mutool 读 PDF 自身目录）。
-// 没有目录时返回空串——不要因为存在 .goodnotes 就谎报来源。
-func outlineSource(pdf *models.PDF) string {
-	return pdf.OutlineOrigin
+	ID             int64    `json:"id"`
+	CacheKey       string   `json:"cache_key"`
+	Title          string   `json:"title"`
+	RelativePath   string   `json:"relative_path"`
+	PageCount      int      `json:"page_count"`
+	FileSize       int64    `json:"file_size"`
+	Pinned         bool     `json:"pinned"`
+	CachedPages    int      `json:"cached_pages"`
+	CacheActive    bool     `json:"cache_active"`
+	CacheSize      int64    `json:"cache_size_mb"`
+	OutlineSources []string `json:"outline_sources"`
+	HasGoodNotes   bool     `json:"has_goodnotes"`
 }
 
 // pdfItem 把数据库记录转换成接口返回结构
 func (s *Server) pdfItem(p *models.PDF) pdfListItem {
 	return pdfListItem{
-		ID:            p.ID,
-		CacheKey:      p.CacheKey,
-		Title:         p.Title,
-		RelativePath:  s.relativePath(p.Path),
-		PageCount:     p.PageCount,
-		FileSize:      p.FileSize,
-		Pinned:        p.Pinned,
-		CachedPages:   p.CachedPages,
-		CacheActive:   p.CacheActive,
-		CacheSize:     p.CacheSize / (1024 * 1024),
-		OutlineSource: outlineSource(p),
-		DeepScan:      p.DeepScan != 0,
+		ID:             p.ID,
+		CacheKey:       p.CacheKey,
+		Title:          p.Title,
+		RelativePath:   s.relativePath(p.Path),
+		PageCount:      p.PageCount,
+		FileSize:       p.FileSize,
+		Pinned:         p.Pinned,
+		CachedPages:    p.CachedPages,
+		CacheActive:    p.CacheActive,
+		CacheSize:      p.CacheSize / (1024 * 1024),
+		OutlineSources: activeOutlineSources(p),
+		HasGoodNotes:   p.GoodNotesPath != "",
 	}
+}
+
+func activeOutlineSources(pdf *models.PDF) []string {
+	sources := models.ParseOutlineSources(pdf.ActiveOutlineSources)
+	if len(sources) == 0 && pdf.ActiveOutlineSources != models.OutlineSourcesNone {
+		sources = models.ParseOutlineSources(pdf.OutlineSources)
+	}
+	if sources == nil {
+		return []string{}
+	}
+	return sources
 }
 
 func (s *Server) handleListPDFs(w http.ResponseWriter, r *http.Request) {
@@ -379,14 +383,6 @@ func (s *Server) handleListMarks(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	hasOutline, _ := s.db.HasOutlineMarks(pdf.ID)
-	// 只有“没有归档文件”的 PDF 才用 mutool 读它自带的目录；
-	// 有 .goodnotes 时目录一律由归档决定，是否读内嵌 PDF 由深度扫描开关控制，
-	// 否则用户关掉深度扫描后又被 mutool 自动补回来。
-	if pdf.GoodNotesPath == "" && !hasOutline && renderer.HasMutool() {
-		s.extractOutline(pdf)
-	}
-
 	marks, err := s.db.ListMarks(pdf.ID)
 	if err != nil {
 		writeError(w, 500, "failed to list marks")
@@ -398,10 +394,8 @@ func (s *Server) handleListMarks(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, marks)
 }
 
-// handleSetDeepScan 打开/关闭某个 PDF 的目录深度扫描，并立即重算目录。
-// 深度扫描用于“导入的 PDF 自带目录”这种情况：归档里没有 GoodNotes 目录，
-// 需要从内嵌 PDF 附件里读。
-func (s *Server) handleSetDeepScan(w http.ResponseWriter, r *http.Request) {
+// handleSetOutlineSources 保存多选目录来源，并立即按新选择重算目录。
+func (s *Server) handleSetOutlineSources(w http.ResponseWriter, r *http.Request) {
 	key := r.PathValue("key")
 	pdf, err := s.db.GetPDFByCacheKey(key)
 	if err != nil || pdf.Deleted {
@@ -410,7 +404,7 @@ func (s *Server) handleSetDeepScan(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var body struct {
-		Enabled bool `json:"enabled"`
+		Sources []string `json:"sources"`
 	}
 	limitedBody(w, r)
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -418,17 +412,20 @@ func (s *Server) handleSetDeepScan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	mode := 0
-	if body.Enabled {
-		mode = 1
+	for _, source := range body.Sources {
+		if source != models.OutlineSourceNotes && source != models.OutlineSourceSourcePDF && source != models.OutlineSourcePDF {
+			writeError(w, 400, "invalid outline source")
+			return
+		}
 	}
-	if err := s.db.SetDeepScan(pdf.ID, mode); err != nil {
-		writeError(w, 500, "failed to update deep scan setting")
+	preference := models.EncodeOutlineSources(body.Sources)
+	if err := s.db.SetOutlineSources(pdf.ID, preference); err != nil {
+		writeError(w, 500, "failed to update outline sources")
 		return
 	}
 	if s.refresher != nil {
 		if err := s.refresher.RefreshOutline(pdf.ID); err != nil {
-			log.Printf("deep scan refresh failed for PDF %d: %v", pdf.ID, err)
+			log.Printf("outline source refresh failed for PDF %d: %v", pdf.ID, err)
 			writeError(w, 500, "failed to refresh outline")
 			return
 		}
@@ -660,7 +657,8 @@ func (s *Server) handleBatchAddMarks(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]interface{}{"status": "added", "count": count})
 }
 
-func (s *Server) handleExtractOutline(w http.ResponseWriter, r *http.Request) {
+// handleRefreshOutline 绕过文件签名缓存，按当前来源选择强制重算目录。
+func (s *Server) handleRefreshOutline(w http.ResponseWriter, r *http.Request) {
 	key := r.PathValue("key")
 	pdf, err := s.db.GetPDFByCacheKey(key)
 	if err != nil || pdf.Deleted {
@@ -668,48 +666,21 @@ func (s *Server) handleExtractOutline(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !renderer.HasMutool() {
-		writeError(w, 400, "mutool not available")
+	if s.refresher == nil {
+		writeError(w, 500, "outline refresher unavailable")
 		return
 	}
-
-	count := s.extractOutline(pdf)
-	writeJSON(w, 200, map[string]int{"outline_entries": count})
-}
-
-// extractOutline 提取PDF目录并存储到数据库
-// 使用 mutool show 命令，失败时静默返回0
-func (s *Server) extractOutline(pdf *models.PDF) int {
-	entries, err := s.renderer.GetOutline(pdf.Path)
+	if err := s.refresher.RefreshOutline(pdf.ID); err != nil {
+		log.Printf("forced outline refresh failed for PDF %d: %v", pdf.ID, err)
+		writeError(w, 500, "failed to refresh outline")
+		return
+	}
+	updated, err := s.db.GetPDF(pdf.ID)
 	if err != nil {
-		log.Printf("outline extraction failed for PDF %d: %v", pdf.ID, err)
-		return 0
+		writeError(w, 500, "failed to load PDF")
+		return
 	}
-	if len(entries) == 0 {
-		return 0
-	}
-	// 目标页不存在的目录项保留标题，但不参与跳转
-	if pdf.PageCount > 0 {
-		for i := range entries {
-			if entries[i].Page > pdf.PageCount {
-				entries[i].Page = 0
-			}
-		}
-	}
-	s.db.DeleteOutlineMarks(pdf.ID)
-	if err := s.db.AddOutlineMarks(pdf.ID, entries); err != nil {
-		log.Printf("failed to store outline for PDF %d: %v", pdf.ID, err)
-		return 0
-	}
-	// 手动从 PDF 提取的目录与归档来源互斥：清掉归档签名并标记来源为 pdf，
-	// 这样下一轮扫描会重新以 .goodnotes 为准，避免"来源显示 GoodNotes、内容是 PDF 目录"。
-	if pdf.GoodNotesPath != "" || pdf.OutlineOrigin != "" {
-		if err := s.db.SetOutlineSource(pdf.ID, "", 0, 0, "pdf"); err != nil {
-			log.Printf("failed to record PDF outline source for %d: %v", pdf.ID, err)
-		}
-	}
-	log.Printf("extracted %d outline entries for PDF %d", len(entries), pdf.ID)
-	return len(entries)
+	writeJSON(w, 200, s.pdfItem(updated))
 }
 
 // handleCacheStats 返回全局缓存使用统计

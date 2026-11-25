@@ -96,10 +96,35 @@
                 <button id="menu-batch-add" class="marks-menu-item" type="button">
                     <span>批量添加目录</span>
                 </button>
-                <label class="marks-menu-item" for="deep-scan-input">
-                    <span>目录深度扫描</span>
-                    <input type="checkbox" id="deep-scan-input" class="menu-switch">
-                </label>
+                <button id="menu-outline-select" class="marks-menu-item outline-source-parent" type="button"
+                    aria-expanded="false" aria-controls="outline-sources-panel">
+                    <span>目录选择</span>
+                    <span class="marks-menu-meta">
+                        <span id="outline-source-summary" class="outline-source-summary"></span>
+                        <svg class="menu-chevron" width="14" height="14" viewBox="0 0 24 24" fill="none"
+                            stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <path d="M9 18l6-6-6-6"/>
+                        </svg>
+                    </span>
+                </button>
+                <div id="outline-sources-panel" class="outline-sources-panel hidden" role="group" aria-label="目录选择">
+                    <label class="marks-menu-item outline-source-item" for="outline-notes">
+                        <span>GoodNotes 笔记目录</span>
+                        <input type="checkbox" id="outline-notes" class="menu-checkbox" data-outline-source="notes">
+                    </label>
+                    <label class="marks-menu-item outline-source-item" for="outline-source-pdf">
+                        <span>GoodNotes 来源 PDF 目录</span>
+                        <input type="checkbox" id="outline-source-pdf" class="menu-checkbox" data-outline-source="source_pdf">
+                    </label>
+                    <label class="marks-menu-item outline-source-item" for="outline-pdf">
+                        <span>PDF 本体目录</span>
+                        <input type="checkbox" id="outline-pdf" class="menu-checkbox" data-outline-source="pdf">
+                    </label>
+                    <div id="outline-source-status" class="marks-menu-status" aria-live="polite"></div>
+                </div>
+                <button id="menu-force-refresh" class="marks-menu-item" type="button">
+                    <span>强制刷新目录</span>
+                </button>
             </div>
         </div>
         <input type="text" id="mark-title-input" placeholder="标记当前页..." maxlength="50">

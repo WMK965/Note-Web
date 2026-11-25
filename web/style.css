@@ -297,7 +297,7 @@ html, body {
 .marks-section {
     display: flex; align-items: center; gap: 6px;
     font-size: 12px; color: var(--text-muted);
-    padding: 12px 8px 6px; text-transform: uppercase; letter-spacing: 0.5px;
+    padding: 12px 8px 6px; letter-spacing: 0.5px;
     cursor: pointer; user-select: none;
 }
 .marks-section:hover { color: var(--text); }
@@ -372,7 +372,7 @@ html, body {
 
 .marks-menu-wrap { position: relative; flex-shrink: 0; }
 .marks-menu {
-    position: absolute; bottom: calc(100% + 8px); left: 0; min-width: 186px;
+    position: absolute; bottom: calc(100% + 8px); left: 0; width: 292px;
     background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
     box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35); padding: 6px; z-index: 30;
 }
@@ -383,18 +383,31 @@ html, body {
     border-radius: 8px; box-sizing: border-box;
 }
 .marks-menu-item:hover { background: var(--surface-active); }
-.menu-switch {
-    appearance: none; width: 34px; height: 20px; border-radius: 10px;
-    background: var(--border); position: relative; cursor: pointer;
-    transition: background 0.15s; flex-shrink: 0; margin: 0;
+.marks-menu-item:disabled { opacity: 0.5; cursor: default; }
+.marks-menu-item:disabled:hover { background: transparent; }
+.marks-menu-meta { display: flex; align-items: center; gap: 6px; color: var(--text-muted); }
+.outline-source-summary { font-size: 12px; white-space: nowrap; }
+.menu-chevron { transition: transform 0.15s ease; flex-shrink: 0; }
+.outline-source-parent[aria-expanded="true"] .menu-chevron { transform: rotate(90deg); }
+.outline-sources-panel {
+    margin: 2px 6px 6px 18px; padding: 4px 0 4px 8px;
+    border-left: 2px solid var(--border);
 }
-.menu-switch::after {
-    content: ''; position: absolute; top: 2px; left: 2px; width: 16px; height: 16px;
-    border-radius: 50%; background: #fff; transition: transform 0.15s;
+.outline-source-item { padding-left: 10px; font-size: 13px; }
+.outline-source-item:has(input:disabled) { opacity: 0.45; cursor: default; }
+.outline-source-item:has(input:disabled):hover { background: transparent; }
+.menu-checkbox {
+    appearance: none; width: 18px; height: 18px; flex-shrink: 0; margin: 0;
+    border: 1.5px solid var(--border); border-radius: 5px; background: var(--bg);
+    cursor: pointer; position: relative;
 }
-.menu-switch:checked { background: var(--accent); }
-.menu-switch:checked::after { transform: translateX(14px); }
-.menu-switch:disabled { opacity: 0.5; cursor: default; }
+.menu-checkbox:checked { background: var(--accent); border-color: var(--accent); }
+.menu-checkbox:checked::after {
+    content: ''; position: absolute; left: 5px; top: 1px; width: 5px; height: 10px;
+    border: solid #fff; border-width: 0 2px 2px 0; transform: rotate(45deg);
+}
+.menu-checkbox:disabled { cursor: default; }
+.marks-menu-status { padding: 5px 8px 3px; min-height: 16px; color: var(--text-muted); font-size: 12px; }
 
 /* ===== Batch Modal ===== */
 .batch-modal {

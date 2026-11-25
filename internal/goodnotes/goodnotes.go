@@ -31,6 +31,12 @@ type Outline struct {
 	Source  string
 }
 
+// SourcesOutline 同时保留 GoodNotes 自建目录和归档内嵌来源 PDF 的目录。
+type SourcesOutline struct {
+	Notes     []models.OutlineEntry
+	SourcePDF []models.OutlineEntry
+}
+
 // Options 控制归档解析行为
 type Options struct {
 	// DeepScan 为真时，GoodNotes 自己没有目录会退回读取内嵌 PDF 附件的书签
@@ -53,47 +59,63 @@ func ParseFile(path string) (Outline, error) {
 
 // ParseFileWithOptions 与 ParseFile 相同，但可以控制是否做目录深度扫描
 func ParseFileWithOptions(path string, opts Options) (Outline, error) {
+	outline, err := parseArchive(path, opts.MaxFileSize, opts.DeepScan)
+	if err != nil {
+		return Outline{}, err
+	}
+	if len(outline.Notes) > 0 {
+		return Outline{Entries: outline.Notes, Source: SourceGoodNotes}, nil
+	}
+	if opts.DeepScan && len(outline.SourcePDF) > 0 {
+		return Outline{Entries: outline.SourcePDF, Source: SourceDeep}, nil
+	}
+	return Outline{}, nil
+}
+
+// ParseSources 同时解析两类 GoodNotes 目录，供多选目录来源使用。
+func ParseSources(path string, opts Options) (SourcesOutline, error) {
+	return parseArchive(path, opts.MaxFileSize, true)
+}
+
+func parseArchive(path string, maxFileSize int64, includeSourcePDF bool) (SourcesOutline, error) {
 	archive, err := zip.OpenReader(path)
 	if err != nil {
-		return Outline{}, fmt.Errorf("open goodnotes archive: %w", err)
+		return SourcesOutline{}, fmt.Errorf("open goodnotes archive: %w", err)
 	}
 	defer archive.Close()
 
 	notesData, err := readArchiveFile(archive, "index.notes.pb", maxNotesBytes)
 	if err != nil {
-		return Outline{}, fmt.Errorf("read index.notes.pb: %w", err)
+		return SourcesOutline{}, fmt.Errorf("read index.notes.pb: %w", err)
 	}
 	eventsData, err := readArchiveFile(archive, "index.events.pb", maxEventsBytes)
 	if err != nil {
-		return Outline{}, fmt.Errorf("read index.events.pb: %w", err)
+		return SourcesOutline{}, fmt.Errorf("read index.events.pb: %w", err)
 	}
 
 	pages, err := parsePages(notesData)
 	if err != nil {
-		return Outline{}, fmt.Errorf("parse index.notes.pb: %w", err)
+		return SourcesOutline{}, fmt.Errorf("parse index.notes.pb: %w", err)
 	}
 	if eventPages, pageErr := parseCurrentPages(eventsData); pageErr != nil {
-		return Outline{}, fmt.Errorf("parse GoodNotes page events: %w", pageErr)
+		return SourcesOutline{}, fmt.Errorf("parse GoodNotes page events: %w", pageErr)
 	} else if len(eventPages) > 0 {
 		pages = eventPages
 	}
 	records, err := parseOutlineRecords(eventsData)
 	if err != nil {
-		return Outline{}, fmt.Errorf("parse index.events.pb: %w", err)
+		return SourcesOutline{}, fmt.Errorf("parse index.events.pb: %w", err)
 	}
 
-	if entries := buildEntries(records, pages); len(entries) > 0 {
-		return Outline{Entries: entries, Source: SourceGoodNotes}, nil
-	}
+	result := SourcesOutline{Notes: buildEntries(records, pages)}
 
-	if opts.DeepScan {
-		entries, pdfErr := parseEmbeddedPDFOutline(archive, opts.MaxFileSize)
+	if includeSourcePDF {
+		entries, pdfErr := parseEmbeddedPDFOutline(archive, maxFileSize)
 		if pdfErr == nil && len(entries) > 0 {
-			return Outline{Entries: entries, Source: SourceDeep}, nil
+			result.SourcePDF = entries
 		}
 	}
-	// 没有内嵌 PDF、它本身没有目录，或关闭了深度扫描，都按“该笔记本没有目录”处理
-	return Outline{}, nil
+	return result, nil
 }
 
 // parseEmbeddedPDFOutline 读取归档里内嵌 PDF 附件的自带目录。

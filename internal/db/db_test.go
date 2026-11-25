@@ -145,6 +145,63 @@ func TestReplaceOutlineMarksFromArchiveRecordsSource(t *testing.T) {
 	}
 }
 
+func TestReplaceOutlineMarksKeepsSourcesSeparate(t *testing.T) {
+	database := newTestDB(t)
+	id, err := database.AddPDF("/documents/book.pdf", "book", "key-book", 10, 10, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries := map[string][]models.OutlineEntry{
+		models.OutlineSourceNotes: {
+			{Level: 0, Page: 1, Title: "笔记第一章"},
+			{Level: 1, Page: 2, Title: "笔记第一节"},
+		},
+		models.OutlineSourceSourcePDF: {
+			{Level: 0, Page: 3, Title: "来源 PDF 第一章"},
+		},
+		models.OutlineSourcePDF: {
+			{Level: 0, Page: 4, Title: "本体目录"},
+		},
+	}
+	preference := models.EncodeOutlineSources([]string{
+		models.OutlineSourceNotes,
+		models.OutlineSourceSourcePDF,
+		models.OutlineSourcePDF,
+	})
+	if err := database.ReplaceOutlineMarks(id, entries, "/documents/book.goodnotes", 123, 456, preference, preference); err != nil {
+		t.Fatalf("replace outline marks: %v", err)
+	}
+
+	marks, err := database.ListMarks(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(marks) != 4 {
+		t.Fatalf("marks = %d, want 4", len(marks))
+	}
+	counts := map[string]int{}
+	for _, mark := range marks {
+		counts[mark.OutlineSource]++
+		if mark.Title == "笔记第一节" && mark.ParentID == 0 {
+			t.Error("notes hierarchy was not preserved")
+		}
+		if mark.OutlineSource == models.OutlineSourceSourcePDF && mark.ParentID != 0 {
+			t.Error("source PDF entry was attached to another source")
+		}
+	}
+	if counts[models.OutlineSourceNotes] != 2 || counts[models.OutlineSourceSourcePDF] != 1 || counts[models.OutlineSourcePDF] != 1 {
+		t.Errorf("source counts = %+v", counts)
+	}
+
+	pdf, err := database.GetPDF(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pdf.OutlineSources != preference || pdf.ActiveOutlineSources != preference {
+		t.Errorf("sources = (%q, %q), want %q", pdf.OutlineSources, pdf.ActiveOutlineSources, preference)
+	}
+}
+
 // 删除 pdfs 记录时，目录项与用户标记都必须被级联清除
 func TestDeletePDFCascadesMarks(t *testing.T) {
 	database := newTestDB(t)
@@ -277,10 +334,10 @@ func TestMigrationUpgradesLegacySchema(t *testing.T) {
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			path TEXT UNIQUE NOT NULL,
 			title TEXT NOT NULL,
-			cache_key TEXT NOT NULL DEFAULT '',
 			page_count INTEGER NOT NULL DEFAULT 0,
 			file_size INTEGER NOT NULL DEFAULT 0,
 			file_mtime INTEGER NOT NULL DEFAULT 0,
+			cache_key TEXT NOT NULL DEFAULT '',
 			pinned INTEGER NOT NULL DEFAULT 0,
 			cache_active INTEGER NOT NULL DEFAULT 0,
 			cache_size INTEGER NOT NULL DEFAULT 0,
@@ -405,5 +462,58 @@ func TestDeepScanPreference(t *testing.T) {
 
 	if err := database.SetDeepScan(id, 7); err == nil {
 		t.Error("非法的 deep_scan 取值应当报错")
+	}
+}
+
+func TestMigrationBackfillsMultiSourcePreference(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy.db")
+	legacy, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = legacy.Exec(`
+		CREATE TABLE pdfs (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			path TEXT UNIQUE NOT NULL,
+			title TEXT NOT NULL,
+			page_count INTEGER NOT NULL DEFAULT 0,
+			file_size INTEGER NOT NULL DEFAULT 0,
+			file_mtime INTEGER NOT NULL DEFAULT 0,
+			pinned INTEGER NOT NULL DEFAULT 0,
+			cache_active INTEGER NOT NULL DEFAULT 0,
+			cache_size INTEGER NOT NULL DEFAULT 0,
+			cached_pages INTEGER NOT NULL DEFAULT 0,
+			cache_last_access TIMESTAMP,
+			deleted INTEGER NOT NULL DEFAULT 0,
+			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+			updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+			outline_origin TEXT NOT NULL DEFAULT '',
+			deep_scan INTEGER NOT NULL DEFAULT -1
+		);
+		INSERT INTO pdfs (path, title, outline_origin, deep_scan)
+		VALUES ('/documents/book.pdf', 'book', 'deep', 1);
+	`)
+	if err != nil {
+		legacy.Close()
+		t.Fatal(err)
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	database, err := Init(path)
+	if err != nil {
+		t.Fatalf("migrate legacy database: %v", err)
+	}
+	defer database.Close()
+	pdf, err := database.GetPDFByPath("/documents/book.pdf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pdf.OutlineSources != models.OutlineSourceSourcePDF {
+		t.Errorf("migrated outline sources = %q, want source_pdf", pdf.OutlineSources)
+	}
+	if pdf.ActiveOutlineSources != "" {
+		t.Errorf("active outline sources = %q, want empty until rescan", pdf.ActiveOutlineSources)
 	}
 }

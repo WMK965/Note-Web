@@ -211,6 +211,33 @@ func TestParseArchiveFallsBackToEmbeddedPDF(t *testing.T) {
 	}
 }
 
+func TestParseSourcesReturnsNotesAndEmbeddedPDFTogether(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "combined.goodnotes")
+	pageID := "00000000-0000-0000-0000-000000000001"
+	noteID := adjacentUUID(pageID, 1)
+	notes := protobufDelimited(protobufMessage(protobufString(1, noteID), protobufString(2, "notes/"+noteID)))
+	events := bytes.Join([][]byte{
+		pageEnvelope(54, pageID, "a"),
+		outlineEnvelope(pageID, "00000000-0000-0000-0000-000000000101", "笔记目录", ""),
+	}, nil)
+	writeArchive(t, path, map[string][]byte{
+		"index.notes.pb":       notes,
+		"index.events.pb":      events,
+		"attachments/embedded": syntheticOutlinePDF(),
+	})
+
+	outline, err := ParseSources(path, Options{MaxFileSize: 1 << 20})
+	if err != nil {
+		t.Fatalf("parse sources: %v", err)
+	}
+	if len(outline.Notes) != 1 || outline.Notes[0].Title != "笔记目录" {
+		t.Errorf("notes = %+v, want one 笔记目录 entry", outline.Notes)
+	}
+	if len(outline.SourcePDF) != 3 || outline.SourcePDF[0].Title != "Chapter 1" {
+		t.Errorf("source PDF = %+v, want three embedded PDF entries", outline.SourcePDF)
+	}
+}
+
 // 内嵌附件里没有 PDF 时，应视为该笔记本没有目录
 func TestParseArchiveWithoutPDFAttachment(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "plain.goodnotes")

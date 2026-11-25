@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
@@ -13,6 +14,7 @@ import (
 
 	"note-web/internal/config"
 	"note-web/internal/db"
+	"note-web/internal/models"
 	"note-web/internal/util"
 )
 
@@ -297,8 +299,8 @@ func pbDelimited(value []byte) []byte {
 	return append(result, value...)
 }
 
-// 深度扫描开关：关闭后应立即清掉从内嵌 PDF 读出的目录，重新开启则恢复
-func TestRefreshOutlineRespectsDeepScanPreference(t *testing.T) {
+// 多来源目录：可分别选择 GoodNotes 笔记目录、来源 PDF 目录和主 PDF 目录
+func TestRefreshOutlineSupportsMultipleSources(t *testing.T) {
 	dir := t.TempDir()
 	pdfPath := filepath.Join(dir, "book.pdf")
 	if err := os.WriteFile(pdfPath, []byte("%PDF-1.4 minimal"), 0o600); err != nil {
@@ -317,7 +319,7 @@ func TestRefreshOutlineRespectsDeepScanPreference(t *testing.T) {
 	if err != nil {
 		t.Fatalf("add pdf: %v", err)
 	}
-	writeImportedArchive(t, filepath.Join(dir, "book.goodnotes"))
+	writeCombinedOutlineArchive(t, filepath.Join(dir, "book.goodnotes"))
 
 	scanner := New(database, nil, testScanConfig(dir, 30*24*time.Hour), config.DatabaseConfig{}, nil)
 	if err := scanner.Scan(); err != nil {
@@ -328,40 +330,132 @@ func TestRefreshOutlineRespectsDeepScanPreference(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(marks) != 3 {
-		t.Fatalf("深度扫描应导入 3 条目录，实际 %d 条: %+v", len(marks), marks)
+	if len(marks) != 2 {
+		t.Fatalf("自动模式应优先导入 2 条 GoodNotes 笔记目录，实际 %d 条: %+v", len(marks), marks)
 	}
 	pdf, err := database.GetPDF(id)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if pdf.OutlineOrigin != "deep" {
-		t.Errorf("outline origin = %q, want %q", pdf.OutlineOrigin, "deep")
+	if pdf.OutlineSources != models.OutlineSourcesAuto || pdf.ActiveOutlineSources != models.OutlineSourceNotes {
+		t.Errorf("sources = (%q, %q), want (auto, notes)", pdf.OutlineSources, pdf.ActiveOutlineSources)
 	}
 
-	// 关闭深度扫描 -> 目录立即消失
-	if err := database.SetDeepScan(id, 0); err != nil {
+	// 同时启用笔记目录和来源 PDF 目录 -> 两套目录各自保留层级
+	both := models.EncodeOutlineSources([]string{models.OutlineSourceNotes, models.OutlineSourceSourcePDF})
+	if err := database.SetOutlineSources(id, both); err != nil {
 		t.Fatal(err)
 	}
 	if err := scanner.RefreshOutline(id); err != nil {
-		t.Fatalf("refresh with deep scan off: %v", err)
+		t.Fatalf("refresh with notes + source PDF: %v", err)
+	}
+	marks, err = database.ListMarks(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	counts := map[string]int{}
+	for _, mark := range marks {
+		counts[mark.OutlineSource]++
+	}
+	if counts[models.OutlineSourceNotes] != 2 || counts[models.OutlineSourceSourcePDF] != 3 {
+		t.Errorf("combined source counts = %+v", counts)
+	}
+
+	// 只保留来源 PDF 目录
+	if err := database.SetOutlineSources(id, models.OutlineSourceSourcePDF); err != nil {
+		t.Fatal(err)
+	}
+	if err := scanner.RefreshOutline(id); err != nil {
+		t.Fatalf("refresh with source PDF only: %v", err)
+	}
+	marks, err = database.ListMarks(id)
+	if err != nil || len(marks) != 3 {
+		t.Errorf("source PDF only marks = %+v (err=%v), want 3", marks, err)
+	}
+	for _, mark := range marks {
+		if mark.OutlineSource != models.OutlineSourceSourcePDF {
+			t.Errorf("unexpected source after selecting source PDF only: %+v", mark)
+		}
+	}
+
+	// 全部关闭 -> 清空自动目录，但保留用户标记能力
+	if err := database.SetOutlineSources(id, models.OutlineSourcesNone); err != nil {
+		t.Fatal(err)
+	}
+	if err := scanner.RefreshOutline(id); err != nil {
+		t.Fatalf("refresh with all sources disabled: %v", err)
 	}
 	if marks, err := database.ListMarks(id); err != nil || len(marks) != 0 {
-		t.Errorf("关闭深度扫描后仍残留目录: %+v (err=%v)", marks, err)
+		t.Errorf("disabled sources marks = %+v (err=%v), want empty", marks, err)
 	}
-	if pdf, err = database.GetPDF(id); err != nil || pdf.OutlineOrigin != "" {
-		t.Errorf("关闭后 outline origin = %q (err=%v), 期望为空", pdf.OutlineOrigin, err)
-	}
+}
 
-	// 重新开启 -> 目录恢复
-	if err := database.SetDeepScan(id, 1); err != nil {
+func writeCombinedOutlineArchive(t *testing.T, path string) {
+	t.Helper()
+	writeGoodNotesArchive(t, path)
+
+	file, err := os.Open(path)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := scanner.RefreshOutline(id); err != nil {
-		t.Fatalf("refresh with deep scan on: %v", err)
+	reader, err := zip.NewReader(file, mustFileSize(t, path))
+	if err != nil {
+		file.Close()
+		t.Fatal(err)
 	}
-	if marks, err := database.ListMarks(id); err != nil || len(marks) != 3 {
-		t.Errorf("重新开启后目录 = %+v (err=%v), 期望 3 条", marks, err)
+	files := map[string][]byte{}
+	for _, entry := range reader.File {
+		rc, err := entry.Open()
+		if err != nil {
+			file.Close()
+			t.Fatal(err)
+		}
+		data, err := io.ReadAll(rc)
+		rc.Close()
+		if err != nil {
+			file.Close()
+			t.Fatal(err)
+		}
+		files[entry.Name] = data
+	}
+	file.Close()
+	files["attachments/embedded"] = outlinePDFBytes()
+	writeArchiveFiles(t, path, files)
+}
+
+func mustFileSize(t *testing.T, path string) int64 {
+	t.Helper()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return info.Size()
+}
+
+func writeArchiveFiles(t *testing.T, path string, files map[string][]byte) {
+	t.Helper()
+	file, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	archive := zip.NewWriter(file)
+	for name, data := range files {
+		writer, err := archive.Create(name)
+		if err != nil {
+			file.Close()
+			t.Fatal(err)
+		}
+		if _, err := writer.Write(data); err != nil {
+			file.Close()
+			t.Fatal(err)
+		}
+	}
+	if err := archive.Close(); err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
 	}
 }
 
